@@ -225,32 +225,19 @@ func (g *Gateway) handleInference(external Protocol) http.HandlerFunc {
 			writeAPIError(w, external, http.StatusBadRequest, err.Error(), "invalid_request_error", "model")
 			return
 		}
-		encoded := body
-		upstreamPayload := payload
-		needsEncoding := false
-		if external == ProtocolAnthropic {
-			upstreamURL := g.cfg.Upstream.Zen
-			if route.Tier == TierGo {
-				upstreamURL = g.cfg.Upstream.Go
-			}
-			if shouldNormalizeAnthropicToolThinkingHistory(model, upstreamURL) {
-				needsEncoding = normalizeAnthropicToolThinkingHistory(upstreamPayload)
-			}
+		upstreamURL := g.cfg.Upstream.Zen
+		if route.Tier == TierGo {
+			upstreamURL = g.cfg.Upstream.Go
 		}
-		if external != route.Protocol {
-			upstreamPayload, err = convertRequest(external, route.Protocol, upstreamPayload)
-			if err != nil {
-				writeAPIError(w, external, http.StatusBadRequest, err.Error(), "invalid_request_error", "")
-				return
-			}
-			needsEncoding = true
+		upstreamPayload, err := prepareUpstreamRequest(external, route.Protocol, payload, upstreamURL)
+		if err != nil {
+			writeAPIError(w, external, http.StatusBadRequest, err.Error(), "invalid_request_error", "")
+			return
 		}
-		if needsEncoding {
-			encoded, err = json.Marshal(upstreamPayload)
-			if err != nil {
-				writeAPIError(w, external, http.StatusBadRequest, "request contains unsupported JSON values", "invalid_request_error", "")
-				return
-			}
+		encoded, err := json.Marshal(upstreamPayload)
+		if err != nil {
+			writeAPIError(w, external, http.StatusBadRequest, "request contains unsupported JSON values", "invalid_request_error", "")
+			return
 		}
 		ids := deriveRequestIDs(r, payload)
 		stream := boolAt(payload, "stream")

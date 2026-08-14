@@ -9,7 +9,7 @@ import (
 )
 
 const (
-	anthropicThinkingPlaceholder         = "tool call"
+	toolReasoningPlaceholder             = "tool call"
 	anthropicRedactedThinkingPlaceholder = "[redacted thinking]"
 )
 
@@ -94,12 +94,43 @@ func convertRequest(from, to Protocol, input map[string]any) (map[string]any, er
 	return encodeBridgeRequest(to, request)
 }
 
-// shouldNormalizeAnthropicToolThinkingHistory identifies providers whose
-// Anthropic-compatible endpoints require a plain thinking block before an
-// assistant tool_use is replayed. Model names cover the normal OpenCode route;
-// the upstream URL also supports deployments that alias those models.
-func shouldNormalizeAnthropicToolThinkingHistory(model, upstreamURL string) bool {
-	return isReasoningVendorIdentifier(model) || isReasoningVendorIdentifier(upstreamURL)
+// prepareUpstreamRequest is the single request preparation path for both
+// pass-through and transcoded requests. Same-protocol requests are cloned so
+// provider-specific fields survive, while cross-protocol requests go through
+// the bridge. Target-protocol normalization then repairs reasoning history in
+// either case.
+func prepareUpstreamRequest(from, to Protocol, input map[string]any, upstreamURL string) (map[string]any, error) {
+	output, err := convertRequest(from, to, input)
+	if err != nil {
+		return nil, err
+	}
+	normalizeToolReasoningHistory(to, stringAt(output, "model"), upstreamURL, output)
+	return output, nil
+}
+
+// normalizeToolReasoningHistory applies only to endpoints that are known to
+// require reasoning replay, or to requests that explicitly enable reasoning.
+// Normalizing the target shape makes the behavior independent of the client
+// protocol used to reach the gateway.
+func normalizeToolReasoningHistory(protocol Protocol, model, upstreamURL string, input map[string]any) bool {
+	if !shouldNormalizeToolReasoningHistory(model, upstreamURL, input) {
+		return false
+	}
+	switch protocol {
+	case ProtocolChat:
+		return normalizeChatToolReasoningHistory(input)
+	case ProtocolAnthropic:
+		return normalizeAnthropicToolThinkingHistory(input)
+	default:
+		return false
+	}
+}
+
+// shouldNormalizeToolReasoningHistory identifies providers whose compatible
+// endpoints require thinking/reasoning to be replayed with assistant tool
+// calls. Explicit reasoning settings also cover aliased model names.
+func shouldNormalizeToolReasoningHistory(model, upstreamURL string, input map[string]any) bool {
+	return isReasoningVendorIdentifier(model) || isReasoningVendorIdentifier(upstreamURL) || requestEnablesReasoning(input)
 }
 
 func isReasoningVendorIdentifier(value string) bool {
@@ -110,6 +141,64 @@ func isReasoningVendorIdentifier(value string) bool {
 		}
 	}
 	return false
+}
+
+func requestEnablesReasoning(input map[string]any) bool {
+	for _, key := range []string{"reasoning_effort", "reasoning", "thinking", "effort"} {
+		value, exists := input[key]
+		if !exists || value == nil {
+			continue
+		}
+		switch typed := value.(type) {
+		case string:
+			mode := strings.ToLower(strings.TrimSpace(typed))
+			if mode != "" && mode != "none" && mode != "disabled" {
+				return true
+			}
+		case bool:
+			if typed {
+				return true
+			}
+		case map[string]any:
+			mode := strings.ToLower(strings.TrimSpace(firstString(stringAt(typed, "type"), stringAt(typed, "effort"))))
+			if mode == "none" || mode == "disabled" {
+				continue
+			}
+			return true
+		default:
+			return true
+		}
+	}
+	return false
+}
+
+// normalizeChatToolReasoningHistory ensures every assistant tool-call turn
+// carries reasoning_content. Some clients discard this non-standard field
+// while retaining tool_calls, which otherwise makes the next thinking-mode
+// request invalid. A legacy reasoning string is promoted when available.
+func normalizeChatToolReasoningHistory(input map[string]any) bool {
+	messages, ok := input["messages"].([]any)
+	if !ok {
+		return false
+	}
+
+	changed := false
+	for _, rawMessage := range messages {
+		message, ok := rawMessage.(map[string]any)
+		if !ok || stringAt(message, "role") != "assistant" || len(sliceAt(message, "tool_calls")) == 0 {
+			continue
+		}
+		if reasoning, ok := message["reasoning_content"].(string); ok && strings.TrimSpace(reasoning) != "" {
+			continue
+		}
+		reasoning, _ := message["reasoning"].(string)
+		if strings.TrimSpace(reasoning) == "" {
+			reasoning = toolReasoningPlaceholder
+		}
+		message["reasoning_content"] = reasoning
+		changed = true
+	}
+	return changed
 }
 
 // normalizeAnthropicToolThinkingHistory repairs only assistant turns that
@@ -148,7 +237,7 @@ func normalizeAnthropicToolThinkingHistory(input map[string]any) bool {
 				}
 				thinking, ok := block["thinking"].(string)
 				if !ok || strings.TrimSpace(thinking) == "" {
-					block["thinking"] = anthropicThinkingPlaceholder
+					block["thinking"] = toolReasoningPlaceholder
 					changed = true
 				}
 			case "redacted_thinking":
@@ -163,7 +252,7 @@ func normalizeAnthropicToolThinkingHistory(input map[string]any) bool {
 		if !hasThinking {
 			content = append([]any{map[string]any{
 				"type":     "thinking",
-				"thinking": anthropicThinkingPlaceholder,
+				"thinking": toolReasoningPlaceholder,
 			}}, content...)
 			message["content"] = content
 			changed = true
