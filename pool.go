@@ -38,6 +38,18 @@ func (p *transportPool) hasHealthy() bool {
 	return false
 }
 
+func (p *transportPool) healthCounts() (total, healthy int) {
+	if p == nil {
+		return 0, 0
+	}
+	for _, proxy := range p.items {
+		if proxy.healthy.Load() {
+			healthy++
+		}
+	}
+	return len(p.items), healthy
+}
+
 func newTransportPool(proxies []string, cfg PerformanceConfig, responseHeaderTimeout time.Duration) (*transportPool, error) {
 	p := &transportPool{items: make([]*proxyTransport, 0, len(proxies))}
 	for _, raw := range proxies {

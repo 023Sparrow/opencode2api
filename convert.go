@@ -195,7 +195,7 @@ func encodeRequest(protocol Protocol, request canonicalRequest) map[string]any {
 		for _, message := range request.Messages {
 			messages = append(messages, encodeChatMessages(message)...)
 		}
-		output["messages"] = messages
+		output["messages"] = normalizeChatToolMessages(messages)
 		put(output, "max_tokens", request.MaxTokens)
 		put(output, "stop", request.Stop)
 		if effort := reasoningEffort(request.Reasoning); effort != nil {
@@ -353,6 +353,121 @@ func encodeChatMessages(message canonicalMessage) []any {
 	}
 	messages = append(messages, results...)
 	return messages
+}
+
+// normalizeChatToolMessages adapts tool history to the stricter ordering used
+// by OpenAI-compatible Chat APIs. Anthropic clients can put tool results and
+// text in one user message, while persisted or compacted agent histories may
+// spread parallel results across multiple messages. Chat requires every
+// assistant tool_calls message to be followed immediately by all matching tool
+// messages.
+//
+// Results are paired globally by tool_call_id and emitted in call order. Tool
+// calls without a result are removed from converted history, because forwarding
+// an unresolved historical call makes the entire request invalid. An orphaned
+// result is retained as ordinary user content instead of an invalid tool
+// message.
+func normalizeChatToolMessages(messages []any) []any {
+	type toolResult struct {
+		message map[string]any
+		used    bool
+	}
+	type toolPair struct {
+		call   any
+		result *toolResult
+	}
+
+	resultsByID := make(map[string][]*toolResult)
+	resultAt := make(map[int]*toolResult)
+	for i, raw := range messages {
+		message, _ := raw.(map[string]any)
+		if stringAt(message, "role") != "tool" {
+			continue
+		}
+		result := &toolResult{message: message}
+		resultAt[i] = result
+		if id := stringAt(message, "tool_call_id"); id != "" {
+			resultsByID[id] = append(resultsByID[id], result)
+		}
+	}
+
+	pairsAt := make(map[int][]toolPair)
+	toolCallAt := make(map[int]bool)
+	for i, raw := range messages {
+		message, _ := raw.(map[string]any)
+		calls := sliceAt(message, "tool_calls")
+		if stringAt(message, "role") != "assistant" || len(calls) == 0 {
+			continue
+		}
+		toolCallAt[i] = true
+		for _, rawCall := range calls {
+			call, _ := rawCall.(map[string]any)
+			id := stringAt(call, "id")
+			for _, result := range resultsByID[id] {
+				if result.used {
+					continue
+				}
+				result.used = true
+				pairsAt[i] = append(pairsAt[i], toolPair{call: rawCall, result: result})
+				break
+			}
+		}
+	}
+
+	out := make([]any, 0, len(messages))
+	for i, raw := range messages {
+		if result := resultAt[i]; result != nil {
+			if !result.used {
+				out = append(out, map[string]any{
+					"role":    "user",
+					"content": contentString(result.message["content"]),
+				})
+			}
+			continue
+		}
+		if !toolCallAt[i] {
+			out = append(out, raw)
+			continue
+		}
+
+		message, _ := raw.(map[string]any)
+		converted := make(map[string]any, len(message))
+		for key, value := range message {
+			converted[key] = value
+		}
+		pairs := pairsAt[i]
+		if len(pairs) == 0 {
+			delete(converted, "tool_calls")
+			if hasChatContent(converted["content"]) {
+				out = append(out, converted)
+			}
+			continue
+		}
+
+		calls := make([]any, 0, len(pairs))
+		for _, pair := range pairs {
+			calls = append(calls, pair.call)
+		}
+		converted["tool_calls"] = calls
+		out = append(out, converted)
+		for _, pair := range pairs {
+			out = append(out, pair.result.message)
+		}
+	}
+	return out
+}
+
+func hasChatContent(value any) bool {
+	switch value := value.(type) {
+	case nil:
+		return false
+	case string:
+		return strings.TrimSpace(value) != ""
+	case []any:
+		return len(value) > 0
+	default:
+		return true
+	}
 }
 
 func encodeChatContent(blocks []canonicalBlock) any {

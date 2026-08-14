@@ -14,7 +14,7 @@
 - 将 key 自动均衡绑定到代理，保持连接亲和性
 - 使用无锁轮询分配并发请求
 - 代理失败后自动迁移绑定，key 失败后进行短时冷却
-- 启动时及每 60 秒通过 Cloudflare trace 并行检查代理可用性
+- 根据真实上游流量识别代理故障，并每 15 分钟通过 Cloudflare trace 并行复查异常代理
 - 为不同会话生成不同的 OpenCode 会话 ID
 
 ## API 路径
@@ -26,6 +26,10 @@
 | `POST` | `/v1/responses` | OpenAI Responses |
 | `POST` | `/v1/messages` | Anthropic Messages |
 | `GET` | `/healthz` | 健康检查 |
+
+`/healthz` 无需 API key，返回服务版本以及模型目录、Zen/Go key 和代理池的汇总状态，不会暴露 key 或代理地址。模型目录尚未完成首次刷新、已经过期、没有可暴露模型或没有健康代理时返回 HTTP `503`；其余情况返回 `200`。
+
+模型目录的过期阈值为 `models.refresh_seconds` 的两倍，且不低于 60 秒。刚启动时短暂返回 `503 starting` 属于正常现象，模型列表首次刷新成功后会变为 `200 ok`。
 
 ## 编译
 

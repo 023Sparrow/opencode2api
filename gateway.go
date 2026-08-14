@@ -32,6 +32,38 @@ type Gateway struct {
 	catalog    *modelCatalog
 }
 
+type healthResponse struct {
+	Status  string        `json:"status"`
+	Ready   bool          `json:"ready"`
+	Version string        `json:"version"`
+	Models  healthModels  `json:"models"`
+	Keys    healthKeys    `json:"keys"`
+	Proxies healthProxies `json:"proxies"`
+	Issues  []string      `json:"issues,omitempty"`
+}
+
+type healthModels struct {
+	Status            string     `json:"status"`
+	Total             int        `json:"total"`
+	Exposed           int        `json:"exposed"`
+	Zen               int        `json:"zen"`
+	Go                int        `json:"go"`
+	LastRefresh       *time.Time `json:"last_refresh,omitempty"`
+	StaleAfterSeconds int        `json:"stale_after_seconds"`
+}
+
+type healthKeys struct {
+	Zen   int `json:"zen"`
+	Go    int `json:"go"`
+	Total int `json:"total"`
+}
+
+type healthProxies struct {
+	Total     int `json:"total"`
+	Healthy   int `json:"healthy"`
+	Unhealthy int `json:"unhealthy"`
+}
+
 func NewGateway(cfg Config, logger *slog.Logger) (*Gateway, error) {
 	transports, err := newTransportPool(cfg.Proxies, cfg.Performance, time.Duration(cfg.Retry.TimeoutSeconds)*time.Second)
 	if err != nil {
@@ -62,10 +94,70 @@ func (g *Gateway) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/chat/completions", g.authenticate(g.handleInference(ProtocolChat)))
 	mux.HandleFunc("POST /v1/responses", g.authenticate(g.handleInference(ProtocolResponses)))
 	mux.HandleFunc("POST /v1/messages", g.authenticate(g.handleInference(ProtocolAnthropic)))
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
-	})
+	mux.HandleFunc("GET /healthz", g.handleHealth)
 	return recoveryMiddleware(g.logger, mux)
+}
+
+func (g *Gateway) handleHealth(w http.ResponseWriter, _ *http.Request) {
+	models := g.catalog.Snapshot()
+	proxyTotal, proxyHealthy := g.transports.healthCounts()
+	zenKeys, goKeys := g.zenNodes.Len(), g.goNodes.Len()
+	staleAfter := max(2*time.Duration(g.cfg.Models.RefreshSeconds)*time.Second, time.Minute)
+
+	modelStatus := "ready"
+	var lastRefresh *time.Time
+	issues := make([]string, 0, 3)
+	if models.UpdatedAt.IsZero() {
+		modelStatus = "pending"
+		issues = append(issues, "model_catalog_pending")
+	} else {
+		updatedAt := models.UpdatedAt.UTC()
+		lastRefresh = &updatedAt
+		if models.Exposed == 0 {
+			modelStatus = "empty"
+			issues = append(issues, "model_catalog_empty")
+		} else if time.Since(models.UpdatedAt) > staleAfter {
+			modelStatus = "stale"
+			issues = append(issues, "model_catalog_stale")
+		}
+	}
+	if zenKeys+goKeys == 0 {
+		issues = append(issues, "no_upstream_keys")
+	}
+	if proxyHealthy == 0 {
+		issues = append(issues, "no_healthy_proxies")
+	}
+
+	status := "ok"
+	httpStatus := http.StatusOK
+	if len(issues) > 0 {
+		status = "degraded"
+		httpStatus = http.StatusServiceUnavailable
+		if modelStatus == "pending" {
+			status = "starting"
+		}
+	}
+	writeJSON(w, httpStatus, healthResponse{
+		Status:  status,
+		Ready:   len(issues) == 0,
+		Version: version,
+		Models: healthModels{
+			Status:            modelStatus,
+			Total:             models.Total,
+			Exposed:           models.Exposed,
+			Zen:               models.Zen,
+			Go:                models.Go,
+			LastRefresh:       lastRefresh,
+			StaleAfterSeconds: int(staleAfter / time.Second),
+		},
+		Keys: healthKeys{Zen: zenKeys, Go: goKeys, Total: zenKeys + goKeys},
+		Proxies: healthProxies{
+			Total:     proxyTotal,
+			Healthy:   proxyHealthy,
+			Unhealthy: proxyTotal - proxyHealthy,
+		},
+		Issues: issues,
+	})
 }
 
 func (g *Gateway) authenticate(next http.HandlerFunc) http.HandlerFunc {

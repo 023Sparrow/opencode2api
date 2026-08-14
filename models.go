@@ -47,6 +47,14 @@ type modelCatalog struct {
 	prefer    Tier
 }
 
+type modelCatalogSnapshot struct {
+	Zen       int
+	Go        int
+	Total     int
+	Exposed   int
+	UpdatedAt time.Time
+}
+
 func newModelCatalog(prefer Tier, overrides map[string]string) *modelCatalog {
 	protocols := make(map[string]Protocol, len(overrides))
 	for model, protocol := range overrides {
@@ -116,6 +124,31 @@ func (c *modelCatalog) List() []string {
 	}
 	sort.Strings(models)
 	return models
+}
+
+func (c *modelCatalog) Snapshot() modelCatalogSnapshot {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	seen := make(map[string]bool, len(c.zen)+len(c.goModels))
+	for model := range c.zen {
+		seen[model] = true
+	}
+	for model := range c.goModels {
+		seen[model] = true
+	}
+	exposed := 0
+	for model := range seen {
+		if supportedModel(model) {
+			exposed++
+		}
+	}
+	return modelCatalogSnapshot{
+		Zen:       len(c.zen),
+		Go:        len(c.goModels),
+		Total:     len(seen),
+		Exposed:   exposed,
+		UpdatedAt: c.updatedAt,
+	}
 }
 
 func toSet(items []string) map[string]bool {
