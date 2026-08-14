@@ -35,6 +35,7 @@ func main() {
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+	gateway.StartProxyHealthChecks(ctx)
 	gateway.StartModelRefresh(ctx)
 
 	server := &http.Server{

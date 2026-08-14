@@ -1,28 +1,33 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
 
 type proxyTransport struct {
-	name   string
-	client *http.Client
+	index   int
+	name    string
+	client  *http.Client
+	healthy atomic.Bool
 }
 
 type transportPool struct {
-	items []proxyTransport
+	items []*proxyTransport
 }
 
 func newTransportPool(proxies []string, cfg PerformanceConfig, responseHeaderTimeout time.Duration) (*transportPool, error) {
-	p := &transportPool{items: make([]proxyTransport, 0, len(proxies))}
+	p := &transportPool{items: make([]*proxyTransport, 0, len(proxies))}
 	for _, raw := range proxies {
 		transport := http.DefaultTransport.(*http.Transport).Clone()
 		transport.MaxIdleConns = cfg.MaxIdleConns
@@ -44,50 +49,171 @@ func newTransportPool(proxies []string, cfg PerformanceConfig, responseHeaderTim
 			}
 			transport.Proxy = http.ProxyURL(u)
 		}
-		p.items = append(p.items, proxyTransport{name: raw, client: &http.Client{Transport: transport}})
+		proxy := &proxyTransport{index: len(p.items), name: raw, client: &http.Client{Transport: transport}}
+		proxy.healthy.Store(true)
+		p.items = append(p.items, proxy)
 	}
 	return p, nil
 }
 
-// upstreamNode is immutable except for health counters. A key is permanently
-// assigned to one proxy, so the request hot path never parses URLs or builds a
-// key/proxy combination.
+type proxyHealthResult struct {
+	proxy      *proxyTransport
+	err        error
+	wasHealthy bool
+}
+
+// CheckHealth checks every route concurrently. A proxy is considered healthy
+// only when the request reaches the target and returns a successful response.
+func (p *transportPool) CheckHealth(ctx context.Context, target string, timeout time.Duration) []proxyHealthResult {
+	results := make(chan proxyHealthResult, len(p.items))
+	for _, proxy := range p.items {
+		go func() {
+			checkCtx, cancel := context.WithTimeout(ctx, timeout)
+			defer cancel()
+			req, err := http.NewRequestWithContext(checkCtx, http.MethodGet, target, nil)
+			if err == nil {
+				req.Header.Set("User-Agent", opencodeUserAgent())
+				resp, requestErr := proxy.client.Do(req)
+				err = requestErr
+				if resp != nil {
+					_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+					_ = resp.Body.Close()
+					if err == nil && resp.StatusCode/100 != 2 {
+						err = fmt.Errorf("health endpoint returned HTTP %d", resp.StatusCode)
+					}
+				}
+			}
+			wasHealthy := true
+			if err == nil {
+				proxy.healthy.Store(true)
+			} else {
+				wasHealthy = proxy.healthy.Swap(false)
+			}
+			results <- proxyHealthResult{proxy: proxy, err: err, wasHealthy: wasHealthy}
+		}()
+	}
+	out := make([]proxyHealthResult, 0, len(p.items))
+	for range p.items {
+		out = append(out, <-results)
+	}
+	return out
+}
+
+// upstreamNode keeps a key stable while allowing its proxy binding to change
+// atomically when a proxy becomes unavailable.
 type upstreamNode struct {
 	key           string
-	proxy         string
-	client        *http.Client
 	index         int
+	proxyIndex    atomic.Int64
 	failures      atomic.Uint32
 	cooldownUntil atomic.Int64
 }
 
 type nodePool struct {
-	nodes    []*upstreamNode
-	next     atomic.Uint64
-	cooldown time.Duration
+	nodes        []*upstreamNode
+	transports   *transportPool
+	next         atomic.Uint64
+	cooldown     time.Duration
+	bindingsMu   sync.Mutex
+	bindingCount []int
 }
 
-// newNodePool distributes N keys over M proxies in round-robin order. N/M must
-// be a positive integer, so every proxy receives exactly the same key count.
+// newNodePool distributes keys over proxies in round-robin order. When there
+// are fewer keys than proxies, the remaining proxies are intentionally idle and
+// can take over a key immediately if an active proxy fails.
 func newNodePool(keys []string, transports *transportPool, cooldown time.Duration) (*nodePool, error) {
+	if transports == nil || len(transports.items) == 0 {
+		return nil, fmt.Errorf("at least one proxy transport is required")
+	}
+	pool := &nodePool{
+		nodes:        make([]*upstreamNode, 0, len(keys)),
+		transports:   transports,
+		cooldown:     cooldown,
+		bindingCount: make([]int, len(transports.items)),
+	}
 	if len(keys) == 0 {
-		return &nodePool{cooldown: cooldown}, nil
+		return pool, nil
 	}
-	if len(transports.items) > len(keys) {
-		return nil, fmt.Errorf("cannot evenly assign %d keys to %d proxies: every proxy must receive at least one key", len(keys), len(transports.items))
-	}
-	if len(keys)%len(transports.items) != 0 {
-		return nil, fmt.Errorf("cannot evenly assign %d keys to %d proxies: key count must be divisible by proxy count", len(keys), len(transports.items))
-	}
-	pool := &nodePool{nodes: make([]*upstreamNode, 0, len(keys)), cooldown: cooldown}
 	for i, key := range keys {
-		proxy := transports.items[i%len(transports.items)]
-		pool.nodes = append(pool.nodes, &upstreamNode{key: key, proxy: proxy.name, client: proxy.client, index: i})
+		proxyIndex := i % len(transports.items)
+		node := &upstreamNode{key: key, index: i}
+		node.proxyIndex.Store(int64(proxyIndex))
+		pool.nodes = append(pool.nodes, node)
+		pool.bindingCount[proxyIndex]++
 	}
 	return pool, nil
 }
 
 func (p *nodePool) Len() int { return len(p.nodes) }
+
+func (p *nodePool) Proxy(node *upstreamNode) *proxyTransport {
+	if p == nil || node == nil || p.transports == nil {
+		return nil
+	}
+	index := int(node.proxyIndex.Load())
+	if index < 0 || index >= len(p.transports.items) {
+		return nil
+	}
+	return p.transports.items[index]
+}
+
+// RebindProxy moves every key currently using failedProxy to the least-loaded
+// healthy proxy. Empty proxies are selected in configuration order; otherwise
+// one of the least-loaded proxies is chosen at random. If every alternative is
+// currently unhealthy, it still attempts the least-loaded alternative.
+func (p *nodePool) RebindProxy(failedProxy int) int {
+	if p == nil || p.transports == nil || len(p.transports.items) < 2 || failedProxy < 0 || failedProxy >= len(p.transports.items) {
+		return 0
+	}
+	p.bindingsMu.Lock()
+	defer p.bindingsMu.Unlock()
+
+	moved := 0
+	for _, node := range p.nodes {
+		if int(node.proxyIndex.Load()) != failedProxy {
+			continue
+		}
+		target := p.replacementLocked(failedProxy, true)
+		if target < 0 {
+			target = p.replacementLocked(failedProxy, false)
+		}
+		if target < 0 {
+			continue
+		}
+		p.bindingCount[failedProxy]--
+		p.bindingCount[target]++
+		node.proxyIndex.Store(int64(target))
+		node.failures.Store(0)
+		node.cooldownUntil.Store(0)
+		moved++
+	}
+	return moved
+}
+
+func (p *nodePool) replacementLocked(failedProxy int, healthyOnly bool) int {
+	minimum := int(^uint(0) >> 1)
+	candidates := make([]int, 0, len(p.transports.items)-1)
+	for i := range p.transports.items {
+		if i == failedProxy || healthyOnly && !p.transports.items[i].healthy.Load() {
+			continue
+		}
+		count := p.bindingCount[i]
+		if count == 0 {
+			return i
+		}
+		if count < minimum {
+			minimum = count
+			candidates = candidates[:0]
+			candidates = append(candidates, i)
+		} else if count == minimum {
+			candidates = append(candidates, i)
+		}
+	}
+	if len(candidates) == 0 {
+		return -1
+	}
+	return candidates[rand.IntN(len(candidates))]
+}
 
 type nodeCursor struct {
 	pool *nodePool
