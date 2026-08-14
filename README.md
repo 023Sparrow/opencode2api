@@ -7,15 +7,15 @@
 - 支持 OpenAI Chat Completions、Responses 和 Models API
 - 支持 Anthropic Messages API
 - 支持普通响应和 SSE 流式响应
-- 支持文本、图片、工具定义、工具调用和工具结果转换
+- 支持文本、图片、thinking/reasoning、工具定义、工具调用和工具结果转换
 - 分离配置 Zen key 池与 Zen Go key 池
 - 模型同时存在于两个上游时按 `prefer` 配置优先使用 Go 或 Zen（默认 Go）
 - 支持直连、HTTP、HTTPS、SOCKS5 和 SOCKS5H 代理
 - 将 key 自动均衡绑定到代理，保持连接亲和性
-- 使用无锁轮询分配并发请求
+- 使用稳定会话哈希保持同一会话的 key/proxy 亲和性，并在节点故障时自动回退
 - 代理失败后自动迁移绑定，key 失败后进行短时冷却
 - 根据真实上游流量识别代理故障，并每 15 分钟通过 Cloudflare trace 并行复查异常代理
-- 为不同会话生成不同的 OpenCode 会话 ID
+- 为不同会话生成不同的 OpenCode 会话 ID，并支持 `x-opencode-session`、`x-session-id` 和 `conversation-id` 显式指定会话
 
 ## API 路径
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"math/rand/v2"
 	"net"
@@ -313,6 +314,19 @@ func (p *nodePool) Cursor() nodeCursor {
 		return nodeCursor{pool: p}
 	}
 	return nodeCursor{pool: p, next: int((p.next.Add(1) - 1) % uint64(len(p.nodes)))}
+}
+
+// CursorFor returns a cursor whose first choice is stable for the supplied
+// affinity key. This keeps every turn in a conversation on the same upstream
+// key while retaining Next's cooldown-aware failover behavior. Empty affinity
+// keys keep the round-robin behavior used by background tasks.
+func (p *nodePool) CursorFor(affinity string) nodeCursor {
+	if affinity == "" || len(p.nodes) == 0 {
+		return p.Cursor()
+	}
+	hash := fnv.New64a()
+	_, _ = hash.Write([]byte(affinity))
+	return nodeCursor{pool: p, next: int(hash.Sum64() % uint64(len(p.nodes)))}
 }
 
 func (c *nodeCursor) Next() *upstreamNode {

@@ -11,6 +11,8 @@ import (
 type bridgeBlock struct {
 	Kind          string
 	Text          string
+	Signature     string
+	Encrypted     string
 	URL           string
 	MediaType     string
 	Data          string
@@ -64,13 +66,14 @@ type bridgeUsage struct {
 }
 
 type bridgeResponse struct {
-	ID      string
-	Model   string
-	Text    string
-	Tools   []bridgeBlock
-	Stop    string
-	Usage   bridgeUsage
-	Created int64
+	ID        string
+	Model     string
+	Text      string
+	Reasoning []bridgeBlock
+	Tools     []bridgeBlock
+	Stop      string
+	Usage     bridgeUsage
+	Created   int64
 }
 
 func convertRequest(from, to Protocol, input map[string]any) (map[string]any, error) {
@@ -104,6 +107,9 @@ func decodeBridgeRequest(protocol Protocol, input map[string]any) (bridgeRequest
 			}
 			role := stringAt(message, "role")
 			blocks := decodeOpenAIBlocks(message["content"])
+			if role == "assistant" {
+				blocks = append(decodeChatReasoning(message), blocks...)
+			}
 			for j, rawCall := range sliceAt(message, "tool_calls") {
 				call, ok := rawCall.(map[string]any)
 				if !ok {
@@ -162,6 +168,10 @@ func decodeBridgeRequest(protocol Protocol, input map[string]any) (bridgeRequest
 					return request, fmt.Errorf("input[%d] must be an object", i)
 				}
 				switch stringAt(item, "type") {
+				case "reasoning":
+					for _, block := range decodeResponsesReasoning(item) {
+						appendBridgeBlock(&request.Messages, "assistant", block)
+					}
 				case "function_call":
 					appendBridgeBlock(&request.Messages, "assistant", bridgeBlock{
 						Kind:          "tool_call",
@@ -304,9 +314,11 @@ func encodeChatRequest(request bridgeRequest) (map[string]any, error) {
 	}
 
 	for i, message := range request.Messages {
-		var content, calls, results []bridgeBlock
+		var content, reasoning, calls, results []bridgeBlock
 		for _, block := range message.Blocks {
 			switch block.Kind {
+			case "reasoning":
+				reasoning = append(reasoning, block)
 			case "tool_call":
 				calls = append(calls, block)
 			case "tool_result":
@@ -323,6 +335,9 @@ func encodeChatRequest(request bridgeRequest) (map[string]any, error) {
 				return nil, fmt.Errorf("messages[%d]: assistant message contains tool results", i)
 			}
 			encoded := map[string]any{"role": "assistant", "content": nil}
+			if value, ok := bridgeReasoningText(reasoning); ok {
+				encoded["reasoning_content"] = value
+			}
 			if len(content) > 0 {
 				encoded["content"] = encodeChatBlocks(content)
 			}
@@ -348,7 +363,7 @@ func encodeChatRequest(request bridgeRequest) (map[string]any, error) {
 				}
 				encoded["tool_calls"] = toolCalls
 			}
-			if len(content) > 0 || len(calls) > 0 {
+			if len(content) > 0 || len(reasoning) > 0 || len(calls) > 0 {
 				messages = append(messages, encoded)
 			}
 			continue
@@ -476,6 +491,9 @@ func encodeResponsesRequest(request bridgeRequest) map[string]any {
 		}
 		for _, block := range message.Blocks {
 			switch block.Kind {
+			case "reasoning":
+				flushContent()
+				items = append(items, encodeResponsesReasoning(block, false))
 			case "text":
 				kind := "input_text"
 				if message.Role == "assistant" {
@@ -620,6 +638,14 @@ func decodeAnthropicBlocks(value any) []bridgeBlock {
 	for _, raw := range asSlice(value) {
 		part, _ := raw.(map[string]any)
 		switch stringAt(part, "type") {
+		case "thinking":
+			blocks = append(blocks, bridgeBlock{
+				Kind:      "reasoning",
+				Text:      stringAt(part, "thinking"),
+				Signature: stringAt(part, "signature"),
+			})
+		case "redacted_thinking":
+			blocks = append(blocks, bridgeBlock{Kind: "reasoning", Encrypted: stringAt(part, "data")})
 		case "text":
 			blocks = append(blocks, bridgeBlock{Kind: "text", Text: stringAt(part, "text")})
 		case "image":
@@ -646,6 +672,85 @@ func decodeAnthropicBlocks(value any) []bridgeBlock {
 		}
 	}
 	return blocks
+}
+
+func decodeChatReasoning(message map[string]any) []bridgeBlock {
+	value, exists := message["reasoning_content"]
+	if !exists {
+		value, exists = message["reasoning"]
+	}
+	text, ok := value.(string)
+	if !exists || !ok {
+		return nil
+	}
+	return []bridgeBlock{{
+		Kind:      "reasoning",
+		Text:      text,
+		Signature: stringAt(message, "reasoning_signature"),
+	}}
+}
+
+func decodeResponsesReasoning(item map[string]any) []bridgeBlock {
+	var text strings.Builder
+	for _, raw := range asSlice(item["summary"]) {
+		part, _ := raw.(map[string]any)
+		text.WriteString(stringAt(part, "text"))
+	}
+	if content := item["content"]; content != nil {
+		for _, raw := range asSlice(content) {
+			part, _ := raw.(map[string]any)
+			text.WriteString(stringAt(part, "text"))
+		}
+	}
+	encrypted := stringAt(item, "encrypted_content")
+	if text.Len() == 0 && encrypted == "" {
+		return nil
+	}
+	return []bridgeBlock{{
+		Kind:      "reasoning",
+		ID:        stringAt(item, "id"),
+		Text:      text.String(),
+		Encrypted: encrypted,
+	}}
+}
+
+func encodeResponsesReasoning(block bridgeBlock, completed bool) map[string]any {
+	id := block.ID
+	if id == "" {
+		id = randomID("rs", 12)
+	}
+	summary := []any{}
+	if block.Text != "" {
+		summary = append(summary, map[string]any{"type": "summary_text", "text": block.Text})
+	}
+	item := map[string]any{"id": id, "type": "reasoning", "summary": summary}
+	if block.Encrypted != "" {
+		item["encrypted_content"] = block.Encrypted
+	}
+	if completed {
+		item["status"] = "completed"
+	}
+	return item
+}
+
+func bridgeReasoningText(blocks []bridgeBlock) (string, bool) {
+	if len(blocks) == 0 {
+		return "", false
+	}
+	var text strings.Builder
+	for _, block := range blocks {
+		text.WriteString(block.Text)
+	}
+	return text.String(), true
+}
+
+func bridgeReasoningSignature(blocks []bridgeBlock) string {
+	for i := len(blocks) - 1; i >= 0; i-- {
+		if blocks[i].Signature != "" {
+			return blocks[i].Signature
+		}
+	}
+	return ""
 }
 
 func encodeChatBlocks(blocks []bridgeBlock) any {
@@ -688,6 +793,13 @@ func encodeAnthropicBlocks(blocks []bridgeBlock) []any {
 			parts = append(parts, map[string]any{"type": "tool_use", "id": block.ID, "name": block.Name, "input": input})
 		case "tool_result":
 			parts = append(parts, map[string]any{"type": "tool_result", "tool_use_id": block.CallID, "content": block.Result, "is_error": block.IsError})
+		case "reasoning":
+			if block.Encrypted != "" {
+				parts = append(parts, map[string]any{"type": "redacted_thinking", "data": block.Encrypted})
+				continue
+			}
+			part := map[string]any{"type": "thinking", "thinking": block.Text, "signature": block.Signature}
+			parts = append(parts, part)
 		}
 	}
 	return parts
@@ -841,6 +953,7 @@ func decodeBridgeResponse(protocol Protocol, input map[string]any) (bridgeRespon
 		}
 		choice, _ := choices[0].(map[string]any)
 		message := mapAt(choice, "message")
+		response.Reasoning = decodeChatReasoning(message)
 		response.Text = bridgeBlocksText(decodeOpenAIBlocks(message["content"]))
 		for _, raw := range sliceAt(message, "tool_calls") {
 			call, _ := raw.(map[string]any)
@@ -858,6 +971,8 @@ func decodeBridgeResponse(protocol Protocol, input map[string]any) (bridgeRespon
 		for _, raw := range sliceAt(input, "output") {
 			item, _ := raw.(map[string]any)
 			switch stringAt(item, "type") {
+			case "reasoning":
+				response.Reasoning = append(response.Reasoning, decodeResponsesReasoning(item)...)
 			case "message":
 				response.Text += bridgeBlocksText(decodeOpenAIBlocks(item["content"]))
 			case "function_call":
@@ -879,7 +994,9 @@ func decodeBridgeResponse(protocol Protocol, input map[string]any) (bridgeRespon
 		response.Usage = decodeOpenAIUsage(mapAt(input, "usage"))
 	case ProtocolAnthropic:
 		for _, block := range decodeAnthropicBlocks(input["content"]) {
-			if block.Kind == "text" {
+			if block.Kind == "reasoning" {
+				response.Reasoning = append(response.Reasoning, block)
+			} else if block.Kind == "text" {
 				response.Text += block.Text
 			} else if block.Kind == "tool_call" {
 				response.Tools = append(response.Tools, block)
@@ -900,6 +1017,12 @@ func encodeBridgeResponse(protocol Protocol, response bridgeResponse) map[string
 	switch protocol {
 	case ProtocolChat:
 		message := map[string]any{"role": "assistant", "content": response.Text}
+		if value, ok := bridgeReasoningText(response.Reasoning); ok {
+			message["reasoning_content"] = value
+		}
+		if signature := bridgeReasoningSignature(response.Reasoning); signature != "" {
+			message["reasoning_signature"] = signature
+		}
 		if len(response.Tools) > 0 {
 			calls := make([]any, 0, len(response.Tools))
 			for _, tool := range response.Tools {
@@ -927,7 +1050,10 @@ func encodeBridgeResponse(protocol Protocol, response bridgeResponse) map[string
 			"usage": openAIUsage(response.Usage),
 		}
 	case ProtocolResponses:
-		output := make([]any, 0, len(response.Tools)+1)
+		output := make([]any, 0, len(response.Reasoning)+len(response.Tools)+1)
+		for _, reasoning := range response.Reasoning {
+			output = append(output, encodeResponsesReasoning(reasoning, true))
+		}
 		if response.Text != "" {
 			output = append(output, map[string]any{
 				"id":     randomID("msg", 12),
@@ -973,7 +1099,8 @@ func encodeBridgeResponse(protocol Protocol, response bridgeResponse) map[string
 			},
 		}
 	case ProtocolAnthropic:
-		content := make([]any, 0, len(response.Tools)+1)
+		content := make([]any, 0, len(response.Reasoning)+len(response.Tools)+1)
+		content = append(content, encodeAnthropicBlocks(response.Reasoning)...)
 		if response.Text != "" {
 			content = append(content, map[string]any{"type": "text", "text": response.Text})
 		}

@@ -297,7 +297,7 @@ func (g *Gateway) doUpstream(ctx context.Context, route modelRoute, body []byte,
 		nodes = g.goNodes
 		baseURL = g.cfg.Upstream.Go
 	}
-	cursor := nodes.Cursor()
+	cursor := nodes.CursorFor(ids.Session)
 	if nodes.Len() == 0 {
 		return nil, fmt.Errorf("no %s nodes configured", route.Tier)
 	}

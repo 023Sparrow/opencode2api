@@ -15,6 +15,7 @@ type bridgeStreamEvent struct {
 	ResponseID string
 	Model      string
 	Text       string
+	Signature  string
 	ToolKey    string
 	ToolID     string
 	ToolName   string
@@ -23,10 +24,11 @@ type bridgeStreamEvent struct {
 }
 
 type bridgeStreamParser struct {
-	protocol     Protocol
-	started      bool
-	tools        map[string]bool
-	responseArgs map[string]bool
+	protocol          Protocol
+	started           bool
+	tools             map[string]bool
+	responseArgs      map[string]bool
+	responseReasoning map[string]bool
 }
 
 func transcodeStream(w http.ResponseWriter, reader io.Reader, from, to Protocol, model string) error {
@@ -35,9 +37,10 @@ func transcodeStream(w http.ResponseWriter, reader io.Reader, from, to Protocol,
 		return fmt.Errorf("response writer does not support streaming")
 	}
 	parser := &bridgeStreamParser{
-		protocol:     from,
-		tools:        map[string]bool{},
-		responseArgs: map[string]bool{},
+		protocol:          from,
+		tools:             map[string]bool{},
+		responseArgs:      map[string]bool{},
+		responseReasoning: map[string]bool{},
 	}
 	emitter := newBridgeStreamEmitter(w, flusher, to, model)
 	if err := readSSE(reader, func(eventName, data string) error {
@@ -132,6 +135,9 @@ func (parser *bridgeStreamParser) parseChat(value map[string]any) []bridgeStream
 	for _, raw := range sliceAt(value, "choices") {
 		choice, _ := raw.(map[string]any)
 		delta := mapAt(choice, "delta")
+		if reasoning := stringAt(delta, "reasoning_content"); reasoning != "" {
+			events = append(events, bridgeStreamEvent{Kind: "reasoning", Text: reasoning})
+		}
 		if text := stringAt(delta, "content"); text != "" {
 			events = append(events, bridgeStreamEvent{Kind: "text", Text: text})
 		}
@@ -170,6 +176,15 @@ func (parser *bridgeStreamParser) parseAnthropic(value map[string]any) ([]bridge
 		block := mapAt(value, "content_block")
 		key := fmt.Sprint(value["index"])
 		switch stringAt(block, "type") {
+		case "thinking":
+			events := make([]bridgeStreamEvent, 0, 2)
+			if thinking := stringAt(block, "thinking"); thinking != "" {
+				events = append(events, bridgeStreamEvent{Kind: "reasoning", Text: thinking})
+			}
+			if signature := stringAt(block, "signature"); signature != "" {
+				events = append(events, bridgeStreamEvent{Kind: "reasoning_signature", Signature: signature})
+			}
+			return events, nil
 		case "tool_use":
 			parser.tools[key] = true
 			return []bridgeStreamEvent{{Kind: "tool_start", ToolKey: key, ToolID: stringAt(block, "id"), ToolName: stringAt(block, "name")}}, nil
@@ -182,6 +197,10 @@ func (parser *bridgeStreamParser) parseAnthropic(value map[string]any) ([]bridge
 		delta := mapAt(value, "delta")
 		key := fmt.Sprint(value["index"])
 		switch stringAt(delta, "type") {
+		case "thinking_delta":
+			return []bridgeStreamEvent{{Kind: "reasoning", Text: stringAt(delta, "thinking")}}, nil
+		case "signature_delta":
+			return []bridgeStreamEvent{{Kind: "reasoning_signature", Signature: stringAt(delta, "signature")}}, nil
 		case "text_delta":
 			return []bridgeStreamEvent{{Kind: "text", Text: stringAt(delta, "text")}}, nil
 		case "input_json_delta":
@@ -217,6 +236,10 @@ func (parser *bridgeStreamParser) parseResponses(eventName string, value map[str
 		return []bridgeStreamEvent{{Kind: "start", ResponseID: stringAt(response, "id"), Model: stringAt(response, "model")}}
 	case "response.output_text.delta":
 		return []bridgeStreamEvent{{Kind: "text", Text: stringAt(value, "delta")}}
+	case "response.reasoning_summary_text.delta":
+		key := responseToolKey(value, nil)
+		parser.responseReasoning[key] = true
+		return []bridgeStreamEvent{{Kind: "reasoning", Text: stringAt(value, "delta")}}
 	case "response.output_item.added":
 		item := mapAt(value, "item")
 		if stringAt(item, "type") == "function_call" {
@@ -230,6 +253,17 @@ func (parser *bridgeStreamParser) parseResponses(eventName string, value map[str
 		return []bridgeStreamEvent{{Kind: "tool_delta", ToolKey: key, Text: stringAt(value, "delta")}}
 	case "response.output_item.done":
 		item := mapAt(value, "item")
+		if stringAt(item, "type") == "reasoning" {
+			key := responseToolKey(value, item)
+			if parser.responseReasoning[key] {
+				return nil
+			}
+			blocks := decodeResponsesReasoning(item)
+			if len(blocks) > 0 {
+				return []bridgeStreamEvent{{Kind: "reasoning", Text: blocks[0].Text}}
+			}
+			return nil
+		}
 		if stringAt(item, "type") == "function_call" {
 			key := responseToolKey(value, item)
 			events := make([]bridgeStreamEvent, 0, 2)
@@ -281,27 +315,36 @@ type bridgeStreamTool struct {
 }
 
 type bridgeStreamEmitter struct {
-	w       io.Writer
-	flush   http.Flusher
-	target  Protocol
-	model   string
-	id      string
-	created int64
-	started bool
-	done    bool
-	stop    string
-	usage   bridgeUsage
-	text    strings.Builder
+	w                  io.Writer
+	flush              http.Flusher
+	target             Protocol
+	model              string
+	id                 string
+	created            int64
+	started            bool
+	done               bool
+	stop               string
+	usage              bridgeUsage
+	text               strings.Builder
+	reasoning          strings.Builder
+	reasoningSignature strings.Builder
 
 	tools map[string]*bridgeStreamTool
 	order []string
 
-	sequence       int
-	nextOutput     int
-	textOpen       bool
-	textItemID     string
-	textOutput     int
-	responseOutput []any
+	sequence        int
+	nextOutput      int
+	textOpen        bool
+	reasoningOpen   bool
+	reasoningClosed bool
+	reasoningItemID string
+	reasoningOutput int
+	reasoningIndex  int
+	textIndex       int
+	nextAnthropic   int
+	textItemID      string
+	textOutput      int
+	responseOutput  []any
 }
 
 func newBridgeStreamEmitter(writer io.Writer, flusher http.Flusher, target Protocol, model string) *bridgeStreamEmitter {
@@ -322,12 +365,24 @@ func (emitter *bridgeStreamEmitter) Emit(event bridgeStreamEvent) error {
 	if event.Model != "" {
 		emitter.model = event.Model
 	}
-	if !emitter.started && (event.Kind == "start" || event.Kind == "text" || event.Kind == "tool_start" || event.Kind == "tool_delta") {
+	if !emitter.started && (event.Kind == "start" || event.Kind == "reasoning" || event.Kind == "reasoning_signature" || event.Kind == "text" || event.Kind == "tool_start" || event.Kind == "tool_delta") {
 		if err := emitter.start(); err != nil {
 			return err
 		}
 	}
 	switch event.Kind {
+	case "reasoning":
+		if event.Text == "" {
+			return nil
+		}
+		emitter.reasoning.WriteString(event.Text)
+		return emitter.emitReasoning(event.Text)
+	case "reasoning_signature":
+		if event.Signature == "" {
+			return nil
+		}
+		emitter.reasoningSignature.WriteString(event.Signature)
+		return emitter.emitReasoningSignature(event.Signature)
 	case "text":
 		if event.Text == "" {
 			return nil
@@ -433,15 +488,22 @@ func (emitter *bridgeStreamEmitter) start() error {
 }
 
 func (emitter *bridgeStreamEmitter) emitText(delta string) error {
+	if emitter.target == ProtocolAnthropic || emitter.target == ProtocolResponses {
+		if err := emitter.finishReasoning(); err != nil {
+			return err
+		}
+	}
 	switch emitter.target {
 	case ProtocolChat:
 		return emitter.chatChunk(map[string]any{"content": delta}, nil)
 	case ProtocolAnthropic:
 		if !emitter.textOpen {
 			emitter.textOpen = true
+			emitter.textIndex = emitter.nextAnthropic
+			emitter.nextAnthropic++
 			if err := emitter.sse("content_block_start", map[string]any{
 				"type":          "content_block_start",
-				"index":         0,
+				"index":         emitter.textIndex,
 				"content_block": map[string]any{"type": "text", "text": ""},
 			}); err != nil {
 				return err
@@ -449,7 +511,7 @@ func (emitter *bridgeStreamEmitter) emitText(delta string) error {
 		}
 		return emitter.sse("content_block_delta", map[string]any{
 			"type":  "content_block_delta",
-			"index": 0,
+			"index": emitter.textIndex,
 			"delta": map[string]any{"type": "text_delta", "text": delta},
 		})
 	case ProtocolResponses:
@@ -472,9 +534,101 @@ func (emitter *bridgeStreamEmitter) emitText(delta string) error {
 	return nil
 }
 
+func (emitter *bridgeStreamEmitter) emitReasoning(delta string) error {
+	if err := emitter.startReasoning(); err != nil {
+		return err
+	}
+	switch emitter.target {
+	case ProtocolChat:
+		return emitter.chatChunk(map[string]any{"reasoning_content": delta}, nil)
+	case ProtocolAnthropic:
+		return emitter.sse("content_block_delta", map[string]any{
+			"type":  "content_block_delta",
+			"index": emitter.reasoningIndex,
+			"delta": map[string]any{"type": "thinking_delta", "thinking": delta},
+		})
+	case ProtocolResponses:
+		return emitter.sse("response.reasoning_summary_text.delta", map[string]any{"type": "response.reasoning_summary_text.delta", "delta": delta, "item_id": emitter.reasoningItemID, "output_index": emitter.reasoningOutput, "summary_index": 0, "sequence_number": emitter.nextSequence()})
+	}
+	return nil
+}
+
+func (emitter *bridgeStreamEmitter) emitReasoningSignature(signature string) error {
+	if err := emitter.startReasoning(); err != nil {
+		return err
+	}
+	switch emitter.target {
+	case ProtocolChat:
+		return emitter.chatChunk(map[string]any{"reasoning_signature": signature}, nil)
+	case ProtocolAnthropic:
+		return emitter.sse("content_block_delta", map[string]any{
+			"type":  "content_block_delta",
+			"index": emitter.reasoningIndex,
+			"delta": map[string]any{"type": "signature_delta", "signature": signature},
+		})
+	}
+	return nil
+}
+
+func (emitter *bridgeStreamEmitter) startReasoning() error {
+	if emitter.reasoningOpen || emitter.reasoningClosed {
+		return nil
+	}
+	emitter.reasoningOpen = true
+	switch emitter.target {
+	case ProtocolAnthropic:
+		emitter.reasoningIndex = emitter.nextAnthropic
+		emitter.nextAnthropic++
+		return emitter.sse("content_block_start", map[string]any{
+			"type":          "content_block_start",
+			"index":         emitter.reasoningIndex,
+			"content_block": map[string]any{"type": "thinking", "thinking": "", "signature": ""},
+		})
+	case ProtocolResponses:
+		emitter.reasoningItemID = randomID("rs", 12)
+		emitter.reasoningOutput = emitter.nextOutput
+		emitter.nextOutput++
+		item := map[string]any{"id": emitter.reasoningItemID, "type": "reasoning", "status": "in_progress", "summary": []any{}}
+		if err := emitter.sse("response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": emitter.reasoningOutput, "item": item, "sequence_number": emitter.nextSequence()}); err != nil {
+			return err
+		}
+		part := map[string]any{"type": "summary_text", "text": ""}
+		return emitter.sse("response.reasoning_summary_part.added", map[string]any{"type": "response.reasoning_summary_part.added", "item_id": emitter.reasoningItemID, "output_index": emitter.reasoningOutput, "summary_index": 0, "part": part, "sequence_number": emitter.nextSequence()})
+	}
+	return nil
+}
+
+func (emitter *bridgeStreamEmitter) finishReasoning() error {
+	if !emitter.reasoningOpen || emitter.reasoningClosed {
+		return nil
+	}
+	emitter.reasoningClosed = true
+	text := emitter.reasoning.String()
+	switch emitter.target {
+	case ProtocolAnthropic:
+		return emitter.sse("content_block_stop", map[string]any{"type": "content_block_stop", "index": emitter.reasoningIndex})
+	case ProtocolResponses:
+		if err := emitter.sse("response.reasoning_summary_text.done", map[string]any{"type": "response.reasoning_summary_text.done", "text": text, "item_id": emitter.reasoningItemID, "output_index": emitter.reasoningOutput, "summary_index": 0, "sequence_number": emitter.nextSequence()}); err != nil {
+			return err
+		}
+		part := map[string]any{"type": "summary_text", "text": text}
+		if err := emitter.sse("response.reasoning_summary_part.done", map[string]any{"type": "response.reasoning_summary_part.done", "item_id": emitter.reasoningItemID, "output_index": emitter.reasoningOutput, "summary_index": 0, "part": part, "sequence_number": emitter.nextSequence()}); err != nil {
+			return err
+		}
+		item := map[string]any{"id": emitter.reasoningItemID, "type": "reasoning", "status": "completed", "summary": []any{part}}
+		return emitter.sse("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": emitter.reasoningOutput, "item": item, "sequence_number": emitter.nextSequence()})
+	}
+	return nil
+}
+
 func (emitter *bridgeStreamEmitter) startTool(tool *bridgeStreamTool) error {
 	if tool.Started || emitter.target == ProtocolAnthropic {
 		return nil
+	}
+	if emitter.target == ProtocolResponses {
+		if err := emitter.finishReasoning(); err != nil {
+			return err
+		}
 	}
 	tool.Started = true
 	switch emitter.target {
@@ -530,6 +684,9 @@ func (emitter *bridgeStreamEmitter) Finish() error {
 			emitter.stop = "stop"
 		}
 	}
+	if err := emitter.finishReasoning(); err != nil {
+		return err
+	}
 	switch emitter.target {
 	case ProtocolChat:
 		if err := emitter.chatChunk(map[string]any{}, chatStop(emitter.stop)); err != nil {
@@ -548,15 +705,15 @@ func (emitter *bridgeStreamEmitter) Finish() error {
 		return emitter.rawSSE("", "[DONE]")
 
 	case ProtocolAnthropic:
-		index := 0
 		if emitter.textOpen {
-			if err := emitter.sse("content_block_stop", map[string]any{"type": "content_block_stop", "index": index}); err != nil {
+			if err := emitter.sse("content_block_stop", map[string]any{"type": "content_block_stop", "index": emitter.textIndex}); err != nil {
 				return err
 			}
-			index++
 		}
 		for _, key := range emitter.order {
 			tool := emitter.tools[key]
+			index := emitter.nextAnthropic
+			emitter.nextAnthropic++
 			if err := emitter.sse("content_block_start", map[string]any{
 				"type":          "content_block_start",
 				"index":         index,
@@ -572,7 +729,6 @@ func (emitter *bridgeStreamEmitter) Finish() error {
 			if err := emitter.sse("content_block_stop", map[string]any{"type": "content_block_stop", "index": index}); err != nil {
 				return err
 			}
-			index++
 		}
 		if err := emitter.sse("message_delta", map[string]any{
 			"type":  "message_delta",
@@ -588,12 +744,16 @@ func (emitter *bridgeStreamEmitter) Finish() error {
 			return err
 		}
 		response := bridgeResponse{
-			ID:      emitter.id,
-			Model:   emitter.model,
-			Text:    emitter.text.String(),
-			Stop:    emitter.stop,
-			Usage:   emitter.usage,
-			Created: emitter.created,
+			ID:        emitter.id,
+			Model:     emitter.model,
+			Text:      emitter.text.String(),
+			Reasoning: []bridgeBlock{{Kind: "reasoning", ID: emitter.reasoningItemID, Text: emitter.reasoning.String(), Signature: emitter.reasoningSignature.String()}},
+			Stop:      emitter.stop,
+			Usage:     emitter.usage,
+			Created:   emitter.created,
+		}
+		if emitter.reasoning.Len() == 0 && emitter.reasoningSignature.Len() == 0 {
+			response.Reasoning = nil
 		}
 		for _, key := range emitter.order {
 			tool := emitter.tools[key]
