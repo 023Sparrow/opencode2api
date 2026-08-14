@@ -15,12 +15,16 @@ var version = "dev"
 
 func main() {
 	configPath := flag.String("config", "config.json", "path to config.json")
+	listen := flag.String("listen", "", "override the configured listen address")
 	flag.Parse()
 
 	cfg, err := LoadConfig(*configPath)
 	if err != nil {
 		slog.Error("configuration error", "error", err)
 		os.Exit(1)
+	}
+	if *listen != "" {
+		cfg.Listen = *listen
 	}
 	level := slog.LevelInfo
 	if cfg.Logging.Level == "debug" {
