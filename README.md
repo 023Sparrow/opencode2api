@@ -40,22 +40,17 @@ go build -o opencode2api ./
 服务器安装 Docker 与 Docker Compose 后，可以在克隆项目后直接启动：
 
 ```bash
-git clone <项目地址>
+git clone https://github.com/jasonxu114514/opencode2api.git
 cd opencode2api
 docker compose up -d
 ```
 
-容器使用 `golang:1.24-alpine`，并将当前项目目录映射到容器内的 `/app`。首次启动会在容器内编译源码，并把生成的二进制文件保存到持久化 Docker volume。后续启动时如果 Go 源码、`go.mod`、`go.sum` 与 Go 版本均未变化，会直接运行已有二进制；源码发生变化时会自动重新编译。
-
-首次启动没有 `config.json` 时，容器会使用 `config.example.json`，因此服务可以正常启动，但示例 key 不能用于实际请求。配置真实 key：
 
 ```bash
 cp config.example.json config.json
 # 编辑 config.json 中的 server_keys、zen_keys 或 go_keys
 docker compose restart
 ```
-
-Compose 会让服务在容器内监听 `0.0.0.0:8080`，无需修改配置文件里的 `listen`。默认映射到宿主机的 `8080` 端口：
 
 ```bash
 curl http://127.0.0.1:8080/healthz
@@ -67,8 +62,6 @@ docker compose logs -f
 ```bash
 OPENCODE2API_PORT=18080 docker compose up -d
 ```
-
-普通的 `docker compose down` 会保留已编译二进制和 Go 构建缓存；使用 `docker compose down -v` 才会同时删除这些持久化 volume。
 
 ## 配置
 
