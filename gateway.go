@@ -226,12 +226,26 @@ func (g *Gateway) handleInference(external Protocol) http.HandlerFunc {
 			return
 		}
 		encoded := body
+		upstreamPayload := payload
+		needsEncoding := false
+		if external == ProtocolAnthropic {
+			upstreamURL := g.cfg.Upstream.Zen
+			if route.Tier == TierGo {
+				upstreamURL = g.cfg.Upstream.Go
+			}
+			if shouldNormalizeAnthropicToolThinkingHistory(model, upstreamURL) {
+				needsEncoding = normalizeAnthropicToolThinkingHistory(upstreamPayload)
+			}
+		}
 		if external != route.Protocol {
-			upstreamPayload, err := convertRequest(external, route.Protocol, payload)
+			upstreamPayload, err = convertRequest(external, route.Protocol, upstreamPayload)
 			if err != nil {
 				writeAPIError(w, external, http.StatusBadRequest, err.Error(), "invalid_request_error", "")
 				return
 			}
+			needsEncoding = true
+		}
+		if needsEncoding {
 			encoded, err = json.Marshal(upstreamPayload)
 			if err != nil {
 				writeAPIError(w, external, http.StatusBadRequest, "request contains unsupported JSON values", "invalid_request_error", "")

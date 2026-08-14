@@ -8,6 +8,13 @@ import (
 	"time"
 )
 
+const (
+	anthropicThinkingPlaceholder         = "tool call"
+	anthropicRedactedThinkingPlaceholder = "[redacted thinking]"
+)
+
+var reasoningVendorHints = [...]string{"moonshot", "kimi", "deepseek", "mimo", "xiaomimimo"}
+
 type bridgeBlock struct {
 	Kind          string
 	Text          string
@@ -85,6 +92,94 @@ func convertRequest(from, to Protocol, input map[string]any) (map[string]any, er
 		return nil, err
 	}
 	return encodeBridgeRequest(to, request)
+}
+
+// shouldNormalizeAnthropicToolThinkingHistory identifies providers whose
+// Anthropic-compatible endpoints require a plain thinking block before an
+// assistant tool_use is replayed. Model names cover the normal OpenCode route;
+// the upstream URL also supports deployments that alias those models.
+func shouldNormalizeAnthropicToolThinkingHistory(model, upstreamURL string) bool {
+	return isReasoningVendorIdentifier(model) || isReasoningVendorIdentifier(upstreamURL)
+}
+
+func isReasoningVendorIdentifier(value string) bool {
+	value = strings.ToLower(value)
+	for _, hint := range reasoningVendorHints {
+		if strings.Contains(value, hint) {
+			return true
+		}
+	}
+	return false
+}
+
+// normalizeAnthropicToolThinkingHistory repairs only assistant turns that
+// contain tool_use. DeepSeek, Kimi/Moonshot and MiMo reject signed, redacted,
+// empty or missing thinking history on those turns even though Anthropic
+// clients can legitimately send each of those shapes.
+func normalizeAnthropicToolThinkingHistory(input map[string]any) bool {
+	messages, ok := input["messages"].([]any)
+	if !ok {
+		return false
+	}
+
+	changed := false
+	for _, rawMessage := range messages {
+		message, ok := rawMessage.(map[string]any)
+		if !ok || stringAt(message, "role") != "assistant" {
+			continue
+		}
+		content, ok := message["content"].([]any)
+		if !ok || !anthropicContentHasType(content, "tool_use") {
+			continue
+		}
+
+		hasThinking := false
+		for i, rawBlock := range content {
+			block, ok := rawBlock.(map[string]any)
+			if !ok {
+				continue
+			}
+			switch stringAt(block, "type") {
+			case "thinking":
+				hasThinking = true
+				if _, exists := block["signature"]; exists {
+					delete(block, "signature")
+					changed = true
+				}
+				thinking, ok := block["thinking"].(string)
+				if !ok || strings.TrimSpace(thinking) == "" {
+					block["thinking"] = anthropicThinkingPlaceholder
+					changed = true
+				}
+			case "redacted_thinking":
+				hasThinking = true
+				content[i] = map[string]any{
+					"type":     "thinking",
+					"thinking": anthropicRedactedThinkingPlaceholder,
+				}
+				changed = true
+			}
+		}
+		if !hasThinking {
+			content = append([]any{map[string]any{
+				"type":     "thinking",
+				"thinking": anthropicThinkingPlaceholder,
+			}}, content...)
+			message["content"] = content
+			changed = true
+		}
+	}
+	return changed
+}
+
+func anthropicContentHasType(content []any, kind string) bool {
+	for _, rawBlock := range content {
+		block, _ := rawBlock.(map[string]any)
+		if stringAt(block, "type") == kind {
+			return true
+		}
+	}
+	return false
 }
 
 func decodeBridgeRequest(protocol Protocol, input map[string]any) (bridgeRequest, error) {

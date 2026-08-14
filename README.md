@@ -181,6 +181,10 @@ SOCKS5 代理示例：
 
 模型同时存在于 Zen 与 Go 时按 `prefer` 配置选择：值为 `go` 时优先 Go，值为 `zen` 时优先 Zen（默认 `go`）。仅存在于某一池时才使用该池的 key。
 
+### Thinking 工具历史兼容
+
+通过 Anthropic Messages API 调用 DeepSeek、Kimi/Moonshot 或 MiMo 模型时，代理会在转发前规范化包含 `tool_use` 的 assistant 历史：保留有效 thinking 文本、为缺失或空的 thinking 补充兼容占位内容、将 `redacted_thinking` 转为普通 thinking，并移除这些兼容端点不接受的 `signature`。该处理仅作用于已知需要此兼容行为的模型或上游地址，普通 Claude/Anthropic 请求不会被修改。
+
 ### `performance`
 
 | 字段 | 含义 |
