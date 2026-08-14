@@ -3,6 +3,7 @@
   "server_keys": ["change-this-local-key"],
   "zen_keys": ["sk-your-zen-key"],
   "go_keys": [],
+  "prefer": "go",
   "proxies": ["direct"],
   "upstream": {
     "zen": "https://opencode.ai/zen",

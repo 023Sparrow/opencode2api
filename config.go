@@ -20,6 +20,7 @@ type Config struct {
 	Models      ModelsConfig      `json:"models"`
 	Performance PerformanceConfig `json:"performance"`
 	Logging     LoggingConfig     `json:"logging"`
+	Prefer      Tier              `json:"prefer"`
 }
 
 type UpstreamConfig struct {
@@ -63,6 +64,7 @@ func LoadConfig(path string) (Config, error) {
 		Models:      ModelsConfig{RefreshSeconds: 300, Protocols: map[string]string{}},
 		Performance: PerformanceConfig{MaxIdleConns: 2048, MaxIdleConnsPerHost: 256, MaxConnsPerHost: 0, IdleConnTimeoutSeconds: 120, ConnectTimeoutSeconds: 5, FailureCooldownSeconds: 15},
 		Logging:     LoggingConfig{Level: "info"},
+		Prefer:      TierGo,
 	}
 	dec := json.NewDecoder(strings.NewReader(string(data)))
 	dec.DisallowUnknownFields()
@@ -73,6 +75,9 @@ func LoadConfig(path string) (Config, error) {
 	trimList(&cfg.ZenKeys)
 	trimList(&cfg.GoKeys)
 	trimList(&cfg.Proxies)
+	if cfg.Prefer != TierZen && cfg.Prefer != TierGo {
+		return Config{}, errors.New("prefer must be \"zen\" or \"go\"")
+	}
 	if cfg.Listen == "" {
 		return Config{}, errors.New("listen must not be empty")
 	}

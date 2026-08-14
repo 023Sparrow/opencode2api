@@ -52,7 +52,7 @@ func NewGateway(cfg Config, logger *slog.Logger) (*Gateway, error) {
 		transports: transports,
 		zenNodes:   zenNodes,
 		goNodes:    goNodes,
-		catalog:    newModelCatalog(cfg.Models.Protocols),
+		catalog:    newModelCatalog(cfg.Prefer, cfg.Models.Protocols),
 	}, nil
 }
 

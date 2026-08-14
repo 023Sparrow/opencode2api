@@ -44,14 +44,15 @@ type modelCatalog struct {
 	goModels  map[string]bool
 	protocols map[string]Protocol
 	updatedAt time.Time
+	prefer    Tier
 }
 
-func newModelCatalog(overrides map[string]string) *modelCatalog {
+func newModelCatalog(prefer Tier, overrides map[string]string) *modelCatalog {
 	protocols := make(map[string]Protocol, len(overrides))
 	for model, protocol := range overrides {
 		protocols[model] = Protocol(protocol)
 	}
-	return &modelCatalog{zen: map[string]bool{}, goModels: map[string]bool{}, protocols: protocols}
+	return &modelCatalog{zen: map[string]bool{}, goModels: map[string]bool{}, protocols: protocols, prefer: prefer}
 }
 
 func (c *modelCatalog) Replace(zen, goModels []string) {
@@ -73,14 +74,22 @@ func (c *modelCatalog) Route(model string, hasZenKeys, hasGoKeys bool) (modelRou
 	if protocol == "" {
 		protocol = inferProtocol(model)
 	}
+	// When a model exists on both tiers, honor the configured priority.
+	preferGo := c.prefer == TierGo
+	if preferGo && c.goModels[model] && hasGoKeys {
+		return modelRoute{ID: model, Tier: TierGo, Protocol: protocol}, nil
+	}
 	if c.zen[model] && hasZenKeys {
 		return modelRoute{ID: model, Tier: TierZen, Protocol: protocol}, nil
 	}
-	if c.goModels[model] && hasGoKeys {
+	if !preferGo && c.goModels[model] && hasGoKeys {
 		return modelRoute{ID: model, Tier: TierGo, Protocol: protocol}, nil
 	}
-	// Model discovery can temporarily fail. Prefer Zen as requested, then Go.
+	// Model discovery can temporarily fail. Honor the configured priority.
 	if len(c.zen) == 0 && len(c.goModels) == 0 {
+		if preferGo && hasGoKeys {
+			return modelRoute{ID: model, Tier: TierGo, Protocol: protocol}, nil
+		}
 		if hasZenKeys {
 			return modelRoute{ID: model, Tier: TierZen, Protocol: protocol}, nil
 		}

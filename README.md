@@ -9,7 +9,7 @@
 - 支持普通响应和 SSE 流式响应
 - 支持文本、图片、工具定义、工具调用和工具结果转换
 - 分离配置 Zen key 池与 Zen Go key 池
-- 模型同时存在于两个上游时优先使用 Zen
+- 模型同时存在于两个上游时按 `prefer` 配置优先使用 Go 或 Zen（默认 Go）
 - 支持直连、HTTP、HTTPS、SOCKS5 和 SOCKS5H 代理
 - 将 key 自动均衡绑定到代理，保持连接亲和性
 - 使用无锁轮询分配并发请求
@@ -51,6 +51,7 @@ cp config.example.json config.json
   "server_keys": ["change-this-local-key"],
   "zen_keys": ["sk-your-zen-key"],
   "go_keys": [],
+  "prefer": "go",
   "proxies": ["direct"],
   "upstream": {
     "zen": "https://opencode.ai/zen",
@@ -86,6 +87,7 @@ cp config.example.json config.json
 | `server_keys` | 调用本代理时使用的本地 API key 列表。它们只用于本地鉴权，不会发送给 OpenCode。 |
 | `zen_keys` | OpenCode Zen API key 池。允许配置多个 key。 |
 | `go_keys` | OpenCode Zen Go API key 池。没有 Go key 时可以使用空数组。 |
+| `prefer` | 模型同时存在于 Zen 与 Go 时优先使用的上游，值为 `go` 或 `zen`，默认 `go`。仅存在于某一池时不受影响。 |
 | `proxies` | 上游代理列表。支持 `direct`、`http://`、`https://`、`socks5://` 和 `socks5h://`。URL 可以包含代理用户名和密码。 |
 
 `server_keys` 至少需要一个值；`zen_keys` 和 `go_keys` 至少有一个池不能为空。
@@ -144,7 +146,7 @@ SOCKS5 代理示例：
 }
 ```
 
-模型同时存在于 Zen 与 Go 时优先选择 Zen；仅存在于 Go 时才使用 Go key 池。
+模型同时存在于 Zen 与 Go 时按 `prefer` 配置选择：值为 `go` 时优先 Go，值为 `zen` 时优先 Zen（默认 `go`）。仅存在于某一池时才使用该池的 key。
 
 ### `performance`
 
