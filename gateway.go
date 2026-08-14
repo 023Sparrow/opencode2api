@@ -19,7 +19,7 @@ const maxRequestBody = 32 << 20
 
 const (
 	proxyHealthCheckURL      = "https://cloudflare.com/cdn-cgi/trace"
-	proxyHealthCheckInterval = 60 * time.Second
+	proxyHealthCheckInterval = 15 * time.Minute
 	proxyHealthCheckTimeout  = 10 * time.Second
 )
 
@@ -242,14 +242,17 @@ func (g *Gateway) doUpstream(ctx context.Context, route modelRoute, body []byte,
 			req.Header.Set("Authorization", "Bearer "+node.key)
 		}
 		resp, err := proxy.client.Do(req)
+		status := 0
+		if resp != nil {
+			status = resp.StatusCode
+		}
+		proxyFailed := g.syncProxyResult(ctx, proxy, status, err)
 		if err == nil && resp.StatusCode/100 == 2 {
 			nodes.MarkSuccess(node)
-			proxy.healthy.Store(true)
 			g.logger.Debug("upstream accepted request", "request_id", ids.Request, "attempt", attempt, "tier", route.Tier, "proxy", redactURL(proxy.name))
 			return resp, nil
 		}
-		if isProxyFailure(resp, err) {
-			g.rebindFailedProxy(proxy)
+		if proxyFailed {
 			if nodes.Proxy(node) == proxy {
 				nodes.MarkFailure(node, resp, err)
 			}
@@ -270,19 +273,46 @@ func (g *Gateway) doUpstream(ctx context.Context, route modelRoute, body []byte,
 	return nil, lastErr
 }
 
-func isProxyFailure(resp *http.Response, err error) bool {
+// syncProxyResult updates proxy health from real traffic. Only timeouts and
+// connection refusals mark a proxy unavailable. Other errors and 4xx/5xx
+// responses trigger a neutral URL check without being treated as proxy failure.
+func (g *Gateway) syncProxyResult(ctx context.Context, proxy *proxyTransport, status int, err error) bool {
+	if proxy == nil {
+		return false
+	}
+	if isProxyFailure(err) {
+		g.rebindFailedProxy(proxy)
+		g.verifyProxyAfterError(ctx, proxy, status)
+		return true
+	}
+	if status >= 200 && status < 400 {
+		wasHealthy := proxy.healthy.Swap(true)
+		if !wasHealthy {
+			g.restoreProxy(proxy)
+		}
+		return false
+	}
 	if err != nil {
-		return true
-	}
-	if resp == nil {
+		g.verifyProxyAfterError(ctx, proxy, status)
 		return false
 	}
-	switch resp.StatusCode {
-	case http.StatusProxyAuthRequired, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
-		return true
-	default:
-		return false
+	if status >= 400 && status < 600 {
+		g.verifyProxyAfterError(ctx, proxy, status)
 	}
+	return false
+}
+
+func (g *Gateway) verifyProxyAfterError(ctx context.Context, proxy *proxyTransport, status int) {
+	if !proxy.checking.CompareAndSwap(false, true) {
+		return
+	}
+	// The client request may finish or be cancelled while the verification is
+	// running. Keep its values but give the proxy check an independent timeout.
+	checkCtx := context.WithoutCancel(ctx)
+	go func() {
+		result := g.transports.checkClaimedProxy(checkCtx, proxy, proxyHealthCheckURL, proxyHealthCheckTimeout)
+		g.applyProxyHealthResult(result, "upstream HTTP response", status)
+	}()
 }
 
 func (g *Gateway) rebindFailedProxy(proxy *proxyTransport) (zenMoved, goMoved int) {
@@ -290,6 +320,10 @@ func (g *Gateway) rebindFailedProxy(proxy *proxyTransport) (zenMoved, goMoved in
 		return 0, 0
 	}
 	wasHealthy := proxy.healthy.Swap(false)
+	return g.rebindUnavailableProxy(proxy, wasHealthy)
+}
+
+func (g *Gateway) rebindUnavailableProxy(proxy *proxyTransport, wasHealthy bool) (zenMoved, goMoved int) {
 	zenMoved = g.zenNodes.RebindProxy(proxy.index)
 	goMoved = g.goNodes.RebindProxy(proxy.index)
 	if wasHealthy || zenMoved+goMoved > 0 {
@@ -298,37 +332,26 @@ func (g *Gateway) rebindFailedProxy(proxy *proxyTransport) (zenMoved, goMoved in
 	return zenMoved, goMoved
 }
 
+func (g *Gateway) restoreProxy(proxy *proxyTransport) (zenMoved, goMoved int) {
+	if proxy == nil {
+		return 0, 0
+	}
+	zenMoved = g.zenNodes.RestoreProxy(proxy.index)
+	goMoved = g.goNodes.RestoreProxy(proxy.index)
+	if zenMoved+goMoved > 0 {
+		g.logger.Info("proxy restored", "proxy", redactURL(proxy.name), "zen_keys_moved", zenMoved, "go_keys_moved", goMoved)
+	}
+	return zenMoved, goMoved
+}
+
 func (g *Gateway) StartProxyHealthChecks(ctx context.Context) {
 	check := func() {
 		results := g.transports.CheckHealth(ctx, proxyHealthCheckURL, proxyHealthCheckTimeout)
-		healthy := 0
 		for _, result := range results {
-			if result.err == nil {
-				healthy++
-			}
-		}
-		for _, result := range results {
-			if result.err != nil {
-				if ctx.Err() != nil {
-					return
-				}
-				zenMoved, goMoved := 0, 0
-				if healthy > 0 {
-					zenMoved = g.zenNodes.RebindProxy(result.proxy.index)
-					goMoved = g.goNodes.RebindProxy(result.proxy.index)
-				}
-				if result.wasHealthy || zenMoved+goMoved > 0 {
-					g.logger.Warn("proxy health check failed", "proxy", redactURL(result.proxy.name), "zen_keys_moved", zenMoved, "go_keys_moved", goMoved, "error", result.err)
-				} else {
-					g.logger.Debug("proxy health check still failing", "proxy", redactURL(result.proxy.name), "error", result.err)
-				}
-				continue
-			}
-			g.logger.Debug("proxy health check passed", "proxy", redactURL(result.proxy.name))
+			g.applyProxyHealthResult(result, "scheduled health check", 0)
 		}
 	}
 	go func() {
-		check()
 		ticker := time.NewTicker(proxyHealthCheckInterval)
 		defer ticker.Stop()
 		for {
@@ -340,6 +363,28 @@ func (g *Gateway) StartProxyHealthChecks(ctx context.Context) {
 			}
 		}
 	}()
+}
+
+func (g *Gateway) applyProxyHealthResult(result proxyHealthResult, source string, upstreamStatus int) {
+	if result.err == nil {
+		if !result.wasHealthy {
+			g.restoreProxy(result.proxy)
+		}
+		g.logger.Debug("proxy health check passed", "source", source, "upstream_status", upstreamStatus, "proxy", redactURL(result.proxy.name))
+		return
+	}
+	if !result.failed {
+		g.logger.Debug("proxy health check inconclusive", "source", source, "upstream_status", upstreamStatus, "proxy", redactURL(result.proxy.name), "error", result.err)
+		return
+	}
+	if g.transports.hasHealthy() {
+		zenMoved, goMoved := g.rebindUnavailableProxy(result.proxy, result.wasHealthy)
+		if result.wasHealthy || zenMoved+goMoved > 0 {
+			g.logger.Warn("proxy health check failed", "source", source, "upstream_status", upstreamStatus, "proxy", redactURL(result.proxy.name), "zen_keys_moved", zenMoved, "go_keys_moved", goMoved, "error", result.err)
+			return
+		}
+	}
+	g.logger.Debug("proxy health check still failing", "source", source, "upstream_status", upstreamStatus, "proxy", redactURL(result.proxy.name), "error", result.err)
 }
 
 func protocolPath(protocol Protocol) string {
@@ -394,11 +439,11 @@ func (g *Gateway) refreshTier(ctx context.Context, base string, nodes *nodePool)
 			cancel()
 			return nil
 		}
-		models, err := fetchModels(refreshCtx, proxy.client, base, node.key)
+		models, status, err := fetchModels(refreshCtx, proxy.client, base, node.key)
+		g.syncProxyResult(refreshCtx, proxy, status, err)
 		cancel()
 		if err == nil {
 			nodes.MarkSuccess(node)
-			proxy.healthy.Store(true)
 			return models
 		}
 		nodes.MarkFailure(node, nil, err)

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand/v2"
@@ -12,18 +13,29 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
 type proxyTransport struct {
-	index   int
-	name    string
-	client  *http.Client
-	healthy atomic.Bool
+	index    int
+	name     string
+	client   *http.Client
+	healthy  atomic.Bool
+	checking atomic.Bool
 }
 
 type transportPool struct {
 	items []*proxyTransport
+}
+
+func (p *transportPool) hasHealthy() bool {
+	for _, proxy := range p.items {
+		if proxy.healthy.Load() {
+			return true
+		}
+	}
+	return false
 }
 
 func newTransportPool(proxies []string, cfg PerformanceConfig, responseHeaderTimeout time.Duration) (*transportPool, error) {
@@ -59,54 +71,87 @@ func newTransportPool(proxies []string, cfg PerformanceConfig, responseHeaderTim
 type proxyHealthResult struct {
 	proxy      *proxyTransport
 	err        error
+	failed     bool
 	wasHealthy bool
 }
 
-// CheckHealth checks every route concurrently. A proxy is considered healthy
-// only when the request reaches the target and returns a successful response.
+// CheckHealth concurrently rechecks only proxies already marked unhealthy.
+// Healthy proxies are skipped before a check is claimed. Any HTTP response
+// from the test URL proves that the route is reachable; only a timeout or
+// connection refusal keeps the proxy unhealthy.
 func (p *transportPool) CheckHealth(ctx context.Context, target string, timeout time.Duration) []proxyHealthResult {
 	results := make(chan proxyHealthResult, len(p.items))
+	checks := 0
 	for _, proxy := range p.items {
+		if proxy.healthy.Load() || !proxy.checking.CompareAndSwap(false, true) {
+			continue
+		}
+		// A real request may have restored the proxy between the first health
+		// read and claiming this check.
+		if proxy.healthy.Load() {
+			proxy.checking.Store(false)
+			continue
+		}
+		checks++
 		go func() {
-			checkCtx, cancel := context.WithTimeout(ctx, timeout)
-			defer cancel()
-			req, err := http.NewRequestWithContext(checkCtx, http.MethodGet, target, nil)
-			if err == nil {
-				req.Header.Set("User-Agent", opencodeUserAgent())
-				resp, requestErr := proxy.client.Do(req)
-				err = requestErr
-				if resp != nil {
-					_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
-					_ = resp.Body.Close()
-					if err == nil && resp.StatusCode/100 != 2 {
-						err = fmt.Errorf("health endpoint returned HTTP %d", resp.StatusCode)
-					}
-				}
-			}
-			wasHealthy := true
-			if err == nil {
-				proxy.healthy.Store(true)
-			} else {
-				wasHealthy = proxy.healthy.Swap(false)
-			}
-			results <- proxyHealthResult{proxy: proxy, err: err, wasHealthy: wasHealthy}
+			results <- p.checkClaimedProxy(ctx, proxy, target, timeout)
 		}()
 	}
-	out := make([]proxyHealthResult, 0, len(p.items))
-	for range p.items {
+	out := make([]proxyHealthResult, 0, checks)
+	for range checks {
 		out = append(out, <-results)
 	}
 	return out
 }
 
+// checkClaimedProxy performs a check after the caller has acquired checking.
+func (p *transportPool) checkClaimedProxy(ctx context.Context, proxy *proxyTransport, target string, timeout time.Duration) proxyHealthResult {
+	defer proxy.checking.Store(false)
+	checkCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(checkCtx, http.MethodGet, target, nil)
+	if err == nil {
+		req.Header.Set("User-Agent", opencodeUserAgent())
+		resp, requestErr := proxy.client.Do(req)
+		err = requestErr
+		if resp != nil {
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+			_ = resp.Body.Close()
+		}
+	}
+	result := proxyHealthResult{proxy: proxy, err: err, wasHealthy: proxy.healthy.Load()}
+	if err == nil {
+		result.wasHealthy = proxy.healthy.Swap(true)
+	} else if isProxyFailure(err) {
+		result.failed = true
+		result.wasHealthy = proxy.healthy.Swap(false)
+	}
+	return result
+}
+
+// isProxyFailure deliberately recognizes only failures that say the proxy
+// route is unavailable. HTTP responses and unrelated transport/protocol errors
+// must not evict a proxy.
+func isProxyFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, syscall.ECONNREFUSED) {
+		return true
+	}
+	var timeout interface{ Timeout() bool }
+	return errors.As(err, &timeout) && timeout.Timeout()
+}
+
 // upstreamNode keeps a key stable while allowing its proxy binding to change
 // atomically when a proxy becomes unavailable.
 type upstreamNode struct {
-	key           string
-	index         int
-	proxyIndex    atomic.Int64
-	failures      atomic.Uint32
-	cooldownUntil atomic.Int64
+	key            string
+	index          int
+	preferredProxy int
+	proxyIndex     atomic.Int64
+	failures       atomic.Uint32
+	cooldownUntil  atomic.Int64
 }
 
 type nodePool struct {
@@ -136,12 +181,40 @@ func newNodePool(keys []string, transports *transportPool, cooldown time.Duratio
 	}
 	for i, key := range keys {
 		proxyIndex := i % len(transports.items)
-		node := &upstreamNode{key: key, index: i}
+		node := &upstreamNode{key: key, index: i, preferredProxy: proxyIndex}
 		node.proxyIndex.Store(int64(proxyIndex))
 		pool.nodes = append(pool.nodes, node)
 		pool.bindingCount[proxyIndex]++
 	}
 	return pool, nil
+}
+
+// RestoreProxy moves keys that were originally assigned to a recovered proxy
+// back to it. Proxies without an original key simply become healthy failover
+// candidates again.
+func (p *nodePool) RestoreProxy(recoveredProxy int) int {
+	if p == nil || p.transports == nil || recoveredProxy < 0 || recoveredProxy >= len(p.transports.items) {
+		return 0
+	}
+	p.bindingsMu.Lock()
+	defer p.bindingsMu.Unlock()
+
+	moved := 0
+	for _, node := range p.nodes {
+		current := int(node.proxyIndex.Load())
+		if node.preferredProxy != recoveredProxy || current == recoveredProxy {
+			continue
+		}
+		if current >= 0 && current < len(p.bindingCount) {
+			p.bindingCount[current]--
+		}
+		p.bindingCount[recoveredProxy]++
+		node.proxyIndex.Store(int64(recoveredProxy))
+		node.failures.Store(0)
+		node.cooldownUntil.Store(0)
+		moved++
+	}
+	return moved
 }
 
 func (p *nodePool) Len() int { return len(p.nodes) }

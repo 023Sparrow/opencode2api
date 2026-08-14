@@ -143,26 +143,26 @@ type modelsResponse struct {
 	} `json:"data"`
 }
 
-func fetchModels(ctx context.Context, client *http.Client, baseURL, key string) ([]string, error) {
+func fetchModels(ctx context.Context, client *http.Client, baseURL, key string) ([]string, int, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(baseURL, "/")+"/v1/models", nil)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	req.Header.Set("Authorization", "Bearer "+key)
 	req.Header.Set("User-Agent", opencodeUserAgent())
 	req.Header.Set("x-opencode-client", "cli")
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode/100 != 2 {
-		return nil, fmt.Errorf("models endpoint returned HTTP %d", resp.StatusCode)
+		return nil, resp.StatusCode, fmt.Errorf("models endpoint returned HTTP %d", resp.StatusCode)
 	}
 	var payload modelsResponse
 	dec := json.NewDecoder(io.LimitReader(resp.Body, 8<<20))
 	if err := dec.Decode(&payload); err != nil {
-		return nil, err
+		return nil, resp.StatusCode, err
 	}
 	models := make([]string, 0, len(payload.Data))
 	for _, item := range payload.Data {
@@ -171,7 +171,7 @@ func fetchModels(ctx context.Context, client *http.Client, baseURL, key string) 
 		}
 	}
 	if len(models) == 0 {
-		return nil, errors.New("models endpoint returned an empty list")
+		return nil, resp.StatusCode, errors.New("models endpoint returned an empty list")
 	}
-	return models, nil
+	return models, resp.StatusCode, nil
 }
