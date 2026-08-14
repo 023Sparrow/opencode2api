@@ -1,0 +1,8 @@
+.key
+config.json
+opencode/
+opencode2api
+opencode2api.exe
+*.log
+.tmp/
+.gocache/
