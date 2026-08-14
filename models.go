@@ -166,7 +166,7 @@ func inferProtocol(model string) Protocol {
 			return ProtocolAnthropic
 		}
 	}
-	for _, prefix := range []string{"gpt-", "o1", "o3", "o4", "grok-"} {
+	for _, prefix := range []string{"gpt-", "o1", "o3", "o4", "grok-", "muse-"} {
 		if strings.HasPrefix(m, prefix) {
 			return ProtocolResponses
 		}

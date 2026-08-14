@@ -344,6 +344,14 @@ func (g *Gateway) doUpstream(ctx context.Context, route modelRoute, body []byte,
 			g.logger.Debug("upstream accepted request", "request_id", ids.Request, "attempt", attempt, "tier", route.Tier, "proxy", redactURL(proxy.name))
 			return resp, nil
 		}
+		// Request-shape errors are deterministic and must be returned to the
+		// caller without rotating through unrelated keys. Authentication,
+		// throttling, server, and transport failures remain retryable.
+		if err == nil && resp.StatusCode >= 400 && resp.StatusCode < 500 && resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusTooManyRequests {
+			nodes.MarkSuccess(node)
+			g.logger.Debug("upstream rejected request without retry", "request_id", ids.Request, "attempt", attempt, "status", resp.StatusCode, "proxy", redactURL(proxy.name))
+			return resp, nil
+		}
 		if proxyFailed {
 			if nodes.Proxy(node) == proxy {
 				nodes.MarkFailure(node, resp, err)

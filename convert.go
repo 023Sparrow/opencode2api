@@ -3,42 +3,49 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 )
 
-type canonicalBlock struct {
-	Type    string
-	Text    string
-	URL     string
-	Media   string
-	Data    string
-	ID      string
-	Name    string
-	Input   any
-	ToolID  string
-	Content any
-	IsError bool
+type bridgeBlock struct {
+	Kind          string
+	Text          string
+	URL           string
+	MediaType     string
+	Data          string
+	ID            string
+	Name          string
+	Arguments     any
+	ArgumentsJSON string
+	CallID        string
+	Result        any
+	IsError       bool
 }
 
-type canonicalMessage struct {
+type bridgeMessage struct {
 	Role   string
-	Blocks []canonicalBlock
+	Blocks []bridgeBlock
 }
 
-type canonicalTool struct {
+type bridgeTool struct {
 	Name        string
 	Description string
-	Parameters  any
+	Schema      any
 	Strict      bool
 }
 
-type canonicalRequest struct {
+type bridgeToolChoice struct {
+	Mode string
+	Name string
+}
+
+type bridgeRequest struct {
 	Model       string
-	System      []canonicalBlock
-	Messages    []canonicalMessage
-	Tools       []canonicalTool
-	ToolChoice  any
+	System      []bridgeBlock
+	Messages    []bridgeMessage
+	Tools       []bridgeTool
+	ToolChoice  bridgeToolChoice
 	Stream      bool
 	Temperature any
 	TopP        any
@@ -48,7 +55,7 @@ type canonicalRequest struct {
 	Metadata    any
 }
 
-type canonicalUsage struct {
+type bridgeUsage struct {
 	Input     int
 	Output    int
 	Total     int
@@ -56,13 +63,13 @@ type canonicalUsage struct {
 	Reasoning int
 }
 
-type canonicalResponse struct {
+type bridgeResponse struct {
 	ID      string
 	Model   string
 	Text    string
-	Tools   []canonicalBlock
+	Tools   []bridgeBlock
 	Stop    string
-	Usage   canonicalUsage
+	Usage   bridgeUsage
 	Created int64
 }
 
@@ -70,15 +77,15 @@ func convertRequest(from, to Protocol, input map[string]any) (map[string]any, er
 	if from == to {
 		return cloneMap(input), nil
 	}
-	canonical, err := decodeRequest(from, input)
+	request, err := decodeBridgeRequest(from, input)
 	if err != nil {
 		return nil, err
 	}
-	return encodeRequest(to, canonical), nil
+	return encodeBridgeRequest(to, request)
 }
 
-func decodeRequest(protocol Protocol, input map[string]any) (canonicalRequest, error) {
-	request := canonicalRequest{
+func decodeBridgeRequest(protocol Protocol, input map[string]any) (bridgeRequest, error) {
+	request := bridgeRequest{
 		Model:       stringAt(input, "model"),
 		Stream:      boolAt(input, "stream"),
 		Temperature: input["temperature"],
@@ -90,399 +97,570 @@ func decodeRequest(protocol Protocol, input map[string]any) (canonicalRequest, e
 		request.MaxTokens = firstAny(input["max_completion_tokens"], input["max_tokens"])
 		request.Stop = input["stop"]
 		request.Reasoning = firstAny(input["reasoning_effort"], input["reasoning"])
-		for _, raw := range sliceAt(input, "messages") {
+		for i, raw := range sliceAt(input, "messages") {
 			message, ok := raw.(map[string]any)
 			if !ok {
-				return request, fmt.Errorf("messages must contain objects")
+				return request, fmt.Errorf("messages[%d] must be an object", i)
 			}
 			role := stringAt(message, "role")
-			blocks := decodeOpenAIContent(message["content"])
-			if role == "system" || role == "developer" {
+			blocks := decodeOpenAIBlocks(message["content"])
+			for j, rawCall := range sliceAt(message, "tool_calls") {
+				call, ok := rawCall.(map[string]any)
+				if !ok {
+					return request, fmt.Errorf("messages[%d].tool_calls[%d] must be an object", i, j)
+				}
+				function := mapAt(call, "function")
+				blocks = append(blocks, bridgeBlock{
+					Kind:          "tool_call",
+					ID:            stringAt(call, "id"),
+					Name:          stringAt(function, "name"),
+					ArgumentsJSON: stringAt(function, "arguments"),
+				})
+			}
+			switch role {
+			case "system", "developer":
 				request.System = append(request.System, blocks...)
-				continue
+			case "tool":
+				request.Messages = append(request.Messages, bridgeMessage{Role: "user", Blocks: []bridgeBlock{{
+					Kind:   "tool_result",
+					CallID: stringAt(message, "tool_call_id"),
+					Result: message["content"],
+				}}})
+			case "user", "assistant":
+				request.Messages = append(request.Messages, bridgeMessage{Role: role, Blocks: blocks})
+			default:
+				return request, fmt.Errorf("messages[%d] has unsupported role %q", i, role)
 			}
-			if role == "tool" {
-				blocks = []canonicalBlock{{Type: "tool_result", ToolID: stringAt(message, "tool_call_id"), Content: message["content"]}}
-				role = "user"
-			}
-			for _, rawCall := range sliceAt(message, "tool_calls") {
-				call, _ := rawCall.(map[string]any)
-				fn, _ := call["function"].(map[string]any)
-				blocks = append(blocks, canonicalBlock{Type: "tool_use", ID: stringAt(call, "id"), Name: stringAt(fn, "name"), Input: parseJSONOrString(stringAt(fn, "arguments"))})
-			}
-			request.Messages = append(request.Messages, canonicalMessage{Role: role, Blocks: blocks})
 		}
-		for _, raw := range sliceAt(input, "tools") {
-			tool, _ := raw.(map[string]any)
-			fn, _ := tool["function"].(map[string]any)
-			request.Tools = append(request.Tools, canonicalTool{Name: stringAt(fn, "name"), Description: stringAt(fn, "description"), Parameters: fn["parameters"], Strict: boolAt(fn, "strict")})
+		for i, raw := range sliceAt(input, "tools") {
+			tool, ok := raw.(map[string]any)
+			if !ok || stringAt(tool, "type") != "function" {
+				return request, fmt.Errorf("tools[%d] must be a function tool", i)
+			}
+			function := mapAt(tool, "function")
+			request.Tools = append(request.Tools, bridgeTool{
+				Name:        stringAt(function, "name"),
+				Description: stringAt(function, "description"),
+				Schema:      function["parameters"],
+				Strict:      boolAt(function, "strict"),
+			})
 		}
 		request.ToolChoice = decodeChatToolChoice(input["tool_choice"])
+
 	case ProtocolResponses:
 		request.MaxTokens = input["max_output_tokens"]
 		request.Stop = input["stop"]
 		request.Reasoning = input["reasoning"]
-		request.System = append(request.System, decodeOpenAIContent(input["instructions"])...)
-		switch raw := input["input"].(type) {
+		request.System = append(request.System, decodeOpenAIBlocks(input["instructions"])...)
+		switch value := input["input"].(type) {
 		case string:
-			request.Messages = append(request.Messages, canonicalMessage{Role: "user", Blocks: []canonicalBlock{{Type: "text", Text: raw}}})
+			request.Messages = append(request.Messages, bridgeMessage{Role: "user", Blocks: []bridgeBlock{{Kind: "text", Text: value}}})
 		case []any:
-			for _, itemRaw := range raw {
-				item, ok := itemRaw.(map[string]any)
+			for i, raw := range value {
+				item, ok := raw.(map[string]any)
 				if !ok {
-					return request, fmt.Errorf("input must contain objects")
+					return request, fmt.Errorf("input[%d] must be an object", i)
 				}
 				switch stringAt(item, "type") {
 				case "function_call":
-					request.Messages = append(request.Messages, canonicalMessage{Role: "assistant", Blocks: []canonicalBlock{{Type: "tool_use", ID: stringAt(item, "call_id"), Name: stringAt(item, "name"), Input: parseJSONOrString(stringAt(item, "arguments"))}}})
+					appendBridgeBlock(&request.Messages, "assistant", bridgeBlock{
+						Kind:          "tool_call",
+						ID:            firstString(stringAt(item, "call_id"), stringAt(item, "id")),
+						Name:          stringAt(item, "name"),
+						ArgumentsJSON: stringAt(item, "arguments"),
+					})
 				case "function_call_output":
-					request.Messages = append(request.Messages, canonicalMessage{Role: "user", Blocks: []canonicalBlock{{Type: "tool_result", ToolID: stringAt(item, "call_id"), Content: item["output"]}}})
-				default:
+					appendBridgeBlock(&request.Messages, "user", bridgeBlock{
+						Kind:   "tool_result",
+						CallID: stringAt(item, "call_id"),
+						Result: item["output"],
+					})
+				case "message", "":
 					role := stringAt(item, "role")
-					blocks := decodeOpenAIContent(item["content"])
+					blocks := decodeOpenAIBlocks(item["content"])
 					if role == "system" || role == "developer" {
 						request.System = append(request.System, blocks...)
-					} else {
-						request.Messages = append(request.Messages, canonicalMessage{Role: role, Blocks: blocks})
+					} else if role == "user" || role == "assistant" {
+						request.Messages = append(request.Messages, bridgeMessage{Role: role, Blocks: blocks})
 					}
 				}
 			}
 		default:
 			return request, fmt.Errorf("input must be a string or array")
 		}
-		for _, raw := range sliceAt(input, "tools") {
-			tool, _ := raw.(map[string]any)
-			if stringAt(tool, "type") != "function" {
-				return request, fmt.Errorf("only function tools can be converted between protocols")
+		for i, raw := range sliceAt(input, "tools") {
+			tool, ok := raw.(map[string]any)
+			if !ok || stringAt(tool, "type") != "function" {
+				return request, fmt.Errorf("tools[%d] must be a function tool", i)
 			}
-			request.Tools = append(request.Tools, canonicalTool{Name: stringAt(tool, "name"), Description: stringAt(tool, "description"), Parameters: tool["parameters"], Strict: boolAt(tool, "strict")})
+			request.Tools = append(request.Tools, bridgeTool{
+				Name:        stringAt(tool, "name"),
+				Description: stringAt(tool, "description"),
+				Schema:      tool["parameters"],
+				Strict:      boolAt(tool, "strict"),
+			})
 		}
 		request.ToolChoice = decodeResponsesToolChoice(input["tool_choice"])
+
 	case ProtocolAnthropic:
 		request.MaxTokens = input["max_tokens"]
 		request.Stop = input["stop_sequences"]
 		request.Reasoning = firstAny(input["thinking"], input["effort"])
-		request.System = decodeAnthropicContent(input["system"])
-		for _, raw := range sliceAt(input, "messages") {
+		request.System = decodeAnthropicBlocks(input["system"])
+		for i, raw := range sliceAt(input, "messages") {
 			message, ok := raw.(map[string]any)
 			if !ok {
-				return request, fmt.Errorf("messages must contain objects")
+				return request, fmt.Errorf("messages[%d] must be an object", i)
 			}
-			request.Messages = append(request.Messages, canonicalMessage{Role: stringAt(message, "role"), Blocks: decodeAnthropicContent(message["content"])})
+			role := stringAt(message, "role")
+			if role != "user" && role != "assistant" {
+				return request, fmt.Errorf("messages[%d] has unsupported role %q", i, role)
+			}
+			request.Messages = append(request.Messages, bridgeMessage{Role: role, Blocks: decodeAnthropicBlocks(message["content"])})
 		}
-		for _, raw := range sliceAt(input, "tools") {
-			tool, _ := raw.(map[string]any)
-			request.Tools = append(request.Tools, canonicalTool{Name: stringAt(tool, "name"), Description: stringAt(tool, "description"), Parameters: tool["input_schema"]})
+		for i, raw := range sliceAt(input, "tools") {
+			tool, ok := raw.(map[string]any)
+			if !ok {
+				return request, fmt.Errorf("tools[%d] must be an object", i)
+			}
+			request.Tools = append(request.Tools, bridgeTool{
+				Name:        stringAt(tool, "name"),
+				Description: stringAt(tool, "description"),
+				Schema:      tool["input_schema"],
+			})
 		}
 		request.ToolChoice = decodeAnthropicToolChoice(input["tool_choice"])
+
 	default:
 		return request, fmt.Errorf("unsupported input protocol %q", protocol)
 	}
 	return request, nil
 }
 
-func encodeRequest(protocol Protocol, request canonicalRequest) map[string]any {
+func appendBridgeBlock(messages *[]bridgeMessage, role string, block bridgeBlock) {
+	if len(*messages) > 0 {
+		last := &(*messages)[len(*messages)-1]
+		if last.Role == role && bridgeBlocksOnlyTools(last.Blocks) {
+			last.Blocks = append(last.Blocks, block)
+			return
+		}
+	}
+	*messages = append(*messages, bridgeMessage{Role: role, Blocks: []bridgeBlock{block}})
+}
+
+func bridgeBlocksOnlyTools(blocks []bridgeBlock) bool {
+	if len(blocks) == 0 {
+		return false
+	}
+	for _, block := range blocks {
+		if block.Kind != "tool_call" && block.Kind != "tool_result" {
+			return false
+		}
+	}
+	return true
+}
+
+func encodeBridgeRequest(protocol Protocol, request bridgeRequest) (map[string]any, error) {
+	switch protocol {
+	case ProtocolChat:
+		return encodeChatRequest(request)
+	case ProtocolResponses:
+		return encodeResponsesRequest(request), nil
+	case ProtocolAnthropic:
+		return encodeAnthropicRequest(request), nil
+	default:
+		return nil, fmt.Errorf("unsupported output protocol %q", protocol)
+	}
+}
+
+func encodeChatRequest(request bridgeRequest) (map[string]any, error) {
 	output := map[string]any{"model": request.Model, "stream": request.Stream}
 	put(output, "temperature", request.Temperature)
 	put(output, "top_p", request.TopP)
-	put(output, "metadata", request.Metadata)
-	switch protocol {
-	case ProtocolChat:
-		messages := make([]any, 0, len(request.Messages)+1)
-		if len(request.System) > 0 {
-			messages = append(messages, map[string]any{"role": "system", "content": encodeChatContent(request.System)})
-		}
-		for _, message := range request.Messages {
-			messages = append(messages, encodeChatMessages(message)...)
-		}
-		output["messages"] = normalizeChatToolMessages(messages)
-		put(output, "max_tokens", request.MaxTokens)
-		put(output, "stop", request.Stop)
-		if effort := reasoningEffort(request.Reasoning); effort != nil {
-			output["reasoning_effort"] = effort
-		}
-		if request.Stream {
-			output["stream_options"] = map[string]any{"include_usage": true}
-		}
-		if len(request.Tools) > 0 {
-			tools := make([]any, 0, len(request.Tools))
-			for _, tool := range request.Tools {
-				tools = append(tools, map[string]any{"type": "function", "function": map[string]any{"name": tool.Name, "description": tool.Description, "parameters": schemaOrDefault(tool.Parameters), "strict": tool.Strict}})
+	put(output, "max_tokens", request.MaxTokens)
+	put(output, "stop", request.Stop)
+	if effort := reasoningEffort(request.Reasoning); effort != nil {
+		output["reasoning_effort"] = effort
+	}
+	if request.Stream {
+		output["stream_options"] = map[string]any{"include_usage": true}
+	}
+
+	messages := make([]any, 0, len(request.Messages)+1)
+	if len(request.System) > 0 {
+		messages = append(messages, map[string]any{"role": "system", "content": encodeChatBlocks(request.System)})
+	}
+	pending := make(map[string]bool)
+	pendingResults := make(map[string]bridgeBlock)
+	var pendingOrder []string
+	var deferred [][]bridgeBlock
+	flushDeferred := func() {
+		for _, blocks := range deferred {
+			if len(blocks) > 0 {
+				messages = append(messages, map[string]any{"role": "user", "content": encodeChatBlocks(blocks)})
 			}
-			output["tools"] = tools
-			put(output, "tool_choice", encodeChatToolChoice(request.ToolChoice))
 		}
-	case ProtocolResponses:
-		if len(request.System) > 0 {
-			output["instructions"] = blocksText(request.System)
-		}
-		items := make([]any, 0, len(request.Messages))
-		for _, message := range request.Messages {
-			items = append(items, encodeResponsesMessage(message)...)
-		}
-		output["input"] = items
-		put(output, "max_output_tokens", request.MaxTokens)
-		put(output, "stop", request.Stop)
-		if request.Reasoning != nil {
-			switch v := request.Reasoning.(type) {
-			case string:
-				output["reasoning"] = map[string]any{"effort": v}
+		deferred = nil
+	}
+
+	for i, message := range request.Messages {
+		var content, calls, results []bridgeBlock
+		for _, block := range message.Blocks {
+			switch block.Kind {
+			case "tool_call":
+				calls = append(calls, block)
+			case "tool_result":
+				results = append(results, block)
 			default:
-				output["reasoning"] = v
+				content = append(content, block)
 			}
 		}
-		if len(request.Tools) > 0 {
-			tools := make([]any, 0, len(request.Tools))
-			for _, tool := range request.Tools {
-				tools = append(tools, map[string]any{"type": "function", "name": tool.Name, "description": tool.Description, "parameters": schemaOrDefault(tool.Parameters), "strict": tool.Strict})
+		if message.Role == "assistant" {
+			if len(pending) > 0 {
+				return nil, fmt.Errorf("messages[%d]: assistant message appears before tool results for %s", i, strings.Join(missingToolIDs(pendingOrder, pending), ", "))
 			}
-			output["tools"] = tools
-			put(output, "tool_choice", encodeResponsesToolChoice(request.ToolChoice))
-		}
-	case ProtocolAnthropic:
-		if len(request.System) > 0 {
-			output["system"] = encodeAnthropicContent(request.System)
-		}
-		messages := make([]any, 0, len(request.Messages))
-		for _, message := range request.Messages {
-			messages = append(messages, map[string]any{"role": normalizeAnthropicRole(message.Role), "content": encodeAnthropicContent(message.Blocks)})
-		}
-		output["messages"] = messages
-		if request.MaxTokens == nil {
-			output["max_tokens"] = 4096
-		} else {
-			output["max_tokens"] = request.MaxTokens
-		}
-		put(output, "stop_sequences", request.Stop)
-		if effort := reasoningEffort(request.Reasoning); effort != nil {
-			output["effort"] = effort
-		}
-		if len(request.Tools) > 0 {
-			tools := make([]any, 0, len(request.Tools))
-			for _, tool := range request.Tools {
-				tools = append(tools, map[string]any{"name": tool.Name, "description": tool.Description, "input_schema": schemaOrDefault(tool.Parameters)})
+			if len(results) > 0 {
+				return nil, fmt.Errorf("messages[%d]: assistant message contains tool results", i)
 			}
-			output["tools"] = tools
-			put(output, "tool_choice", encodeAnthropicToolChoice(request.ToolChoice))
+			encoded := map[string]any{"role": "assistant", "content": nil}
+			if len(content) > 0 {
+				encoded["content"] = encodeChatBlocks(content)
+			}
+			if len(calls) > 0 {
+				toolCalls := make([]any, 0, len(calls))
+				for _, call := range calls {
+					if call.ID == "" || call.Name == "" {
+						return nil, fmt.Errorf("messages[%d]: tool call must contain id and name", i)
+					}
+					if pending[call.ID] {
+						return nil, fmt.Errorf("messages[%d]: duplicate tool call id %q", i, call.ID)
+					}
+					pending[call.ID] = true
+					pendingOrder = append(pendingOrder, call.ID)
+					toolCalls = append(toolCalls, map[string]any{
+						"id":   call.ID,
+						"type": "function",
+						"function": map[string]any{
+							"name":      call.Name,
+							"arguments": bridgeArgumentsJSON(call),
+						},
+					})
+				}
+				encoded["tool_calls"] = toolCalls
+			}
+			if len(content) > 0 || len(calls) > 0 {
+				messages = append(messages, encoded)
+			}
+			continue
+		}
+
+		if len(calls) > 0 {
+			return nil, fmt.Errorf("messages[%d]: user message contains tool calls", i)
+		}
+		for _, result := range results {
+			if _, duplicate := pendingResults[result.CallID]; duplicate {
+				return nil, fmt.Errorf("messages[%d]: duplicate tool result %q", i, result.CallID)
+			}
+			if !pending[result.CallID] {
+				return nil, fmt.Errorf("messages[%d]: tool result %q has no pending tool call", i, result.CallID)
+			}
+			pendingResults[result.CallID] = result
+			delete(pending, result.CallID)
+		}
+		if len(content) > 0 {
+			if len(pendingOrder) > 0 || len(deferred) > 0 {
+				deferred = append(deferred, content)
+			} else {
+				messages = append(messages, map[string]any{"role": "user", "content": encodeChatBlocks(content)})
+			}
+		}
+		if len(pending) == 0 && len(pendingOrder) > 0 {
+			for _, id := range pendingOrder {
+				result := pendingResults[id]
+				messages = append(messages, map[string]any{
+					"role":         "tool",
+					"tool_call_id": id,
+					"content":      bridgeToolResultContent(result.Result),
+				})
+			}
+			flushDeferred()
+			pendingOrder = nil
+			clear(pendingResults)
+		}
+	}
+	if len(pending) > 0 {
+		return nil, fmt.Errorf("tool calls are missing results for %s", strings.Join(missingToolIDs(pendingOrder, pending), ", "))
+	}
+	flushDeferred()
+	output["messages"] = messages
+
+	if len(request.Tools) > 0 {
+		tools := make([]any, 0, len(request.Tools))
+		for _, tool := range request.Tools {
+			function := map[string]any{
+				"name":        tool.Name,
+				"description": tool.Description,
+				"parameters":  schemaOrDefault(tool.Schema),
+			}
+			if tool.Strict {
+				function["strict"] = true
+			}
+			tools = append(tools, map[string]any{"type": "function", "function": function})
+		}
+		output["tools"] = tools
+		if choice := encodeChatToolChoice(request.ToolChoice); choice != nil {
+			output["tool_choice"] = choice
+		}
+	}
+	return output, nil
+}
+
+func missingToolIDs(order []string, pending map[string]bool) []string {
+	missing := make([]string, 0, len(pending))
+	for _, id := range order {
+		if pending[id] {
+			missing = append(missing, id)
+		}
+	}
+	if len(missing) == len(pending) {
+		return missing
+	}
+	for id := range pending {
+		found := false
+		for _, current := range missing {
+			if current == id {
+				found = true
+				break
+			}
+		}
+		if !found {
+			missing = append(missing, id)
+		}
+	}
+	sort.Strings(missing)
+	return missing
+}
+
+func encodeResponsesRequest(request bridgeRequest) map[string]any {
+	output := map[string]any{"model": request.Model, "stream": request.Stream}
+	put(output, "temperature", request.Temperature)
+	put(output, "top_p", request.TopP)
+	put(output, "max_output_tokens", request.MaxTokens)
+	put(output, "stop", request.Stop)
+	put(output, "metadata", request.Metadata)
+	if len(request.System) > 0 {
+		output["instructions"] = bridgeBlocksText(request.System)
+	}
+	if request.Reasoning != nil {
+		switch value := request.Reasoning.(type) {
+		case string:
+			output["reasoning"] = map[string]any{"effort": value}
+		default:
+			output["reasoning"] = value
+		}
+	}
+
+	items := make([]any, 0, len(request.Messages))
+	for _, message := range request.Messages {
+		var content []any
+		flushContent := func() {
+			if len(content) == 0 {
+				return
+			}
+			items = append(items, map[string]any{
+				"type":    "message",
+				"role":    normalizeResponsesRole(message.Role),
+				"content": content,
+			})
+			content = nil
+		}
+		for _, block := range message.Blocks {
+			switch block.Kind {
+			case "text":
+				kind := "input_text"
+				if message.Role == "assistant" {
+					kind = "output_text"
+				}
+				content = append(content, map[string]any{"type": kind, "text": block.Text})
+			case "image":
+				url := block.URL
+				if url == "" && block.Data != "" {
+					url = "data:" + block.MediaType + ";base64," + block.Data
+				}
+				content = append(content, map[string]any{"type": "input_image", "image_url": url})
+			case "tool_call":
+				flushContent()
+				items = append(items, map[string]any{
+					"type":      "function_call",
+					"call_id":   block.ID,
+					"name":      block.Name,
+					"arguments": bridgeArgumentsJSON(block),
+				})
+			case "tool_result":
+				flushContent()
+				items = append(items, map[string]any{
+					"type":    "function_call_output",
+					"call_id": block.CallID,
+					"output":  bridgeToolResultContent(block.Result),
+				})
+			}
+		}
+		flushContent()
+	}
+	output["input"] = items
+	if len(request.Tools) > 0 {
+		tools := make([]any, 0, len(request.Tools))
+		for _, tool := range request.Tools {
+			tools = append(tools, map[string]any{
+				"type":        "function",
+				"name":        tool.Name,
+				"description": tool.Description,
+				"parameters":  schemaOrDefault(tool.Schema),
+				"strict":      tool.Strict,
+			})
+		}
+		output["tools"] = tools
+		if choice := encodeResponsesToolChoice(request.ToolChoice); choice != nil {
+			output["tool_choice"] = choice
 		}
 	}
 	return output
 }
 
-func decodeOpenAIContent(value any) []canonicalBlock {
+func encodeAnthropicRequest(request bridgeRequest) map[string]any {
+	output := map[string]any{"model": request.Model, "stream": request.Stream}
+	put(output, "temperature", request.Temperature)
+	put(output, "top_p", request.TopP)
+	put(output, "stop_sequences", request.Stop)
+	if request.MaxTokens == nil {
+		output["max_tokens"] = 4096
+	} else {
+		output["max_tokens"] = request.MaxTokens
+	}
+	if effort := reasoningEffort(request.Reasoning); effort != nil {
+		output["effort"] = effort
+	}
+	if len(request.System) > 0 {
+		output["system"] = encodeAnthropicBlocks(request.System)
+	}
+
+	messages := make([]any, 0, len(request.Messages))
+	for _, message := range request.Messages {
+		content := encodeAnthropicBlocks(message.Blocks)
+		if len(content) == 0 {
+			continue
+		}
+		role := "user"
+		if message.Role == "assistant" {
+			role = "assistant"
+		}
+		if len(messages) > 0 {
+			last, _ := messages[len(messages)-1].(map[string]any)
+			if stringAt(last, "role") == role {
+				last["content"] = append(asSlice(last["content"]), content...)
+				continue
+			}
+		}
+		messages = append(messages, map[string]any{"role": role, "content": content})
+	}
+	output["messages"] = messages
+	if len(request.Tools) > 0 {
+		tools := make([]any, 0, len(request.Tools))
+		for _, tool := range request.Tools {
+			tools = append(tools, map[string]any{
+				"name":         tool.Name,
+				"description":  tool.Description,
+				"input_schema": schemaOrDefault(tool.Schema),
+			})
+		}
+		output["tools"] = tools
+		if choice := encodeAnthropicToolChoice(request.ToolChoice); choice != nil {
+			output["tool_choice"] = choice
+		}
+	}
+	return output
+}
+
+func decodeOpenAIBlocks(value any) []bridgeBlock {
 	switch value := value.(type) {
 	case string:
 		if value == "" {
 			return nil
 		}
-		return []canonicalBlock{{Type: "text", Text: value}}
+		return []bridgeBlock{{Kind: "text", Text: value}}
+	case map[string]any:
+		return decodeOpenAIBlocks([]any{value})
 	case []any:
-		var blocks []canonicalBlock
+		blocks := make([]bridgeBlock, 0, len(value))
 		for _, raw := range value {
 			part, _ := raw.(map[string]any)
 			switch stringAt(part, "type") {
 			case "text", "input_text", "output_text":
-				blocks = append(blocks, canonicalBlock{Type: "text", Text: stringAt(part, "text")})
+				blocks = append(blocks, bridgeBlock{Kind: "text", Text: stringAt(part, "text")})
 			case "image_url":
-				blocks = append(blocks, canonicalBlock{Type: "image", URL: stringAt(part, "image_url", "url")})
+				blocks = append(blocks, bridgeBlock{Kind: "image", URL: firstString(stringAt(part, "image_url", "url"), stringAt(part, "image_url"))})
 			case "input_image":
-				blocks = append(blocks, canonicalBlock{Type: "image", URL: stringAt(part, "image_url")})
+				blocks = append(blocks, bridgeBlock{Kind: "image", URL: stringAt(part, "image_url")})
 			}
 		}
 		return blocks
-	case map[string]any:
-		return decodeOpenAIContent([]any{value})
 	default:
 		return nil
 	}
 }
 
-func decodeAnthropicContent(value any) []canonicalBlock {
+func decodeAnthropicBlocks(value any) []bridgeBlock {
 	if text, ok := value.(string); ok {
-		return []canonicalBlock{{Type: "text", Text: text}}
+		if text == "" {
+			return nil
+		}
+		return []bridgeBlock{{Kind: "text", Text: text}}
 	}
-	var blocks []canonicalBlock
+	var blocks []bridgeBlock
 	for _, raw := range asSlice(value) {
 		part, _ := raw.(map[string]any)
 		switch stringAt(part, "type") {
 		case "text":
-			blocks = append(blocks, canonicalBlock{Type: "text", Text: stringAt(part, "text")})
+			blocks = append(blocks, bridgeBlock{Kind: "text", Text: stringAt(part, "text")})
 		case "image":
-			source, _ := part["source"].(map[string]any)
+			source := mapAt(part, "source")
 			if stringAt(source, "type") == "url" {
-				blocks = append(blocks, canonicalBlock{Type: "image", URL: stringAt(source, "url")})
+				blocks = append(blocks, bridgeBlock{Kind: "image", URL: stringAt(source, "url")})
 			} else {
-				blocks = append(blocks, canonicalBlock{Type: "image", Media: stringAt(source, "media_type"), Data: stringAt(source, "data")})
+				blocks = append(blocks, bridgeBlock{Kind: "image", MediaType: stringAt(source, "media_type"), Data: stringAt(source, "data")})
 			}
 		case "tool_use":
-			blocks = append(blocks, canonicalBlock{Type: "tool_use", ID: stringAt(part, "id"), Name: stringAt(part, "name"), Input: part["input"]})
+			blocks = append(blocks, bridgeBlock{
+				Kind:      "tool_call",
+				ID:        stringAt(part, "id"),
+				Name:      stringAt(part, "name"),
+				Arguments: part["input"],
+			})
 		case "tool_result":
-			blocks = append(blocks, canonicalBlock{Type: "tool_result", ToolID: stringAt(part, "tool_use_id"), Content: part["content"], IsError: boolAt(part, "is_error")})
+			blocks = append(blocks, bridgeBlock{
+				Kind:    "tool_result",
+				CallID:  stringAt(part, "tool_use_id"),
+				Result:  part["content"],
+				IsError: boolAt(part, "is_error"),
+			})
 		}
 	}
 	return blocks
 }
 
-func encodeChatMessages(message canonicalMessage) []any {
-	out := map[string]any{"role": normalizeChatRole(message.Role)}
-	var content []canonicalBlock
-	var toolCalls []any
-	var results []any
-	for _, block := range message.Blocks {
-		switch block.Type {
-		case "tool_use":
-			args, _ := json.Marshal(block.Input)
-			toolCalls = append(toolCalls, map[string]any{"id": block.ID, "type": "function", "function": map[string]any{"name": block.Name, "arguments": string(args)}})
-		case "tool_result":
-			results = append(results, map[string]any{"role": "tool", "tool_call_id": block.ToolID, "content": contentString(block.Content)})
-		default:
-			content = append(content, block)
-		}
-	}
-	if len(content) > 0 {
-		out["content"] = encodeChatContent(content)
-	} else {
-		out["content"] = nil
-	}
-	if len(toolCalls) > 0 {
-		out["tool_calls"] = toolCalls
-	}
-	messages := make([]any, 0, len(results)+1)
-	if len(content) > 0 || len(toolCalls) > 0 {
-		messages = append(messages, out)
-	}
-	messages = append(messages, results...)
-	return messages
-}
-
-// normalizeChatToolMessages adapts tool history to the stricter ordering used
-// by OpenAI-compatible Chat APIs. Anthropic clients can put tool results and
-// text in one user message, while persisted or compacted agent histories may
-// spread parallel results across multiple messages. Chat requires every
-// assistant tool_calls message to be followed immediately by all matching tool
-// messages.
-//
-// Results are paired globally by tool_call_id and emitted in call order. Tool
-// calls without a result are removed from converted history, because forwarding
-// an unresolved historical call makes the entire request invalid. An orphaned
-// result is retained as ordinary user content instead of an invalid tool
-// message.
-func normalizeChatToolMessages(messages []any) []any {
-	type toolResult struct {
-		message map[string]any
-		used    bool
-	}
-	type toolPair struct {
-		call   any
-		result *toolResult
-	}
-
-	resultsByID := make(map[string][]*toolResult)
-	resultAt := make(map[int]*toolResult)
-	for i, raw := range messages {
-		message, _ := raw.(map[string]any)
-		if stringAt(message, "role") != "tool" {
-			continue
-		}
-		result := &toolResult{message: message}
-		resultAt[i] = result
-		if id := stringAt(message, "tool_call_id"); id != "" {
-			resultsByID[id] = append(resultsByID[id], result)
-		}
-	}
-
-	pairsAt := make(map[int][]toolPair)
-	toolCallAt := make(map[int]bool)
-	for i, raw := range messages {
-		message, _ := raw.(map[string]any)
-		calls := sliceAt(message, "tool_calls")
-		if stringAt(message, "role") != "assistant" || len(calls) == 0 {
-			continue
-		}
-		toolCallAt[i] = true
-		for _, rawCall := range calls {
-			call, _ := rawCall.(map[string]any)
-			id := stringAt(call, "id")
-			for _, result := range resultsByID[id] {
-				if result.used {
-					continue
-				}
-				result.used = true
-				pairsAt[i] = append(pairsAt[i], toolPair{call: rawCall, result: result})
-				break
-			}
-		}
-	}
-
-	out := make([]any, 0, len(messages))
-	for i, raw := range messages {
-		if result := resultAt[i]; result != nil {
-			if !result.used {
-				out = append(out, map[string]any{
-					"role":    "user",
-					"content": contentString(result.message["content"]),
-				})
-			}
-			continue
-		}
-		if !toolCallAt[i] {
-			out = append(out, raw)
-			continue
-		}
-
-		message, _ := raw.(map[string]any)
-		converted := make(map[string]any, len(message))
-		for key, value := range message {
-			converted[key] = value
-		}
-		pairs := pairsAt[i]
-		if len(pairs) == 0 {
-			delete(converted, "tool_calls")
-			if hasChatContent(converted["content"]) {
-				out = append(out, converted)
-			}
-			continue
-		}
-
-		calls := make([]any, 0, len(pairs))
-		for _, pair := range pairs {
-			calls = append(calls, pair.call)
-		}
-		converted["tool_calls"] = calls
-		out = append(out, converted)
-		for _, pair := range pairs {
-			out = append(out, pair.result.message)
-		}
-	}
-	return out
-}
-
-func hasChatContent(value any) bool {
-	switch value := value.(type) {
-	case nil:
-		return false
-	case string:
-		return strings.TrimSpace(value) != ""
-	case []any:
-		return len(value) > 0
-	default:
-		return true
-	}
-}
-
-func encodeChatContent(blocks []canonicalBlock) any {
-	if len(blocks) == 1 && blocks[0].Type == "text" {
+func encodeChatBlocks(blocks []bridgeBlock) any {
+	if len(blocks) == 1 && blocks[0].Kind == "text" {
 		return blocks[0].Text
 	}
 	parts := make([]any, 0, len(blocks))
 	for _, block := range blocks {
-		switch block.Type {
+		switch block.Kind {
 		case "text":
 			parts = append(parts, map[string]any{"type": "text", "text": block.Text})
 		case "image":
 			url := block.URL
 			if url == "" && block.Data != "" {
-				url = "data:" + block.Media + ";base64," + block.Data
+				url = "data:" + block.MediaType + ";base64," + block.Data
 			}
 			parts = append(parts, map[string]any{"type": "image_url", "image_url": map[string]any{"url": url}})
 		}
@@ -490,71 +668,165 @@ func encodeChatContent(blocks []canonicalBlock) any {
 	return parts
 }
 
-func encodeResponsesMessage(message canonicalMessage) []any {
-	var output []any
-	var content []any
-	for _, block := range message.Blocks {
-		switch block.Type {
-		case "text":
-			kind := "input_text"
-			if message.Role == "assistant" {
-				kind = "output_text"
-			}
-			content = append(content, map[string]any{"type": kind, "text": block.Text})
-		case "image":
-			url := block.URL
-			if url == "" {
-				url = "data:" + block.Media + ";base64," + block.Data
-			}
-			content = append(content, map[string]any{"type": "input_image", "image_url": url})
-		case "tool_use":
-			args, _ := json.Marshal(block.Input)
-			output = append(output, map[string]any{"type": "function_call", "call_id": block.ID, "name": block.Name, "arguments": string(args)})
-		case "tool_result":
-			output = append(output, map[string]any{"type": "function_call_output", "call_id": block.ToolID, "output": contentString(block.Content)})
-		}
-	}
-	if len(content) > 0 {
-		output = append([]any{map[string]any{"role": normalizeResponsesRole(message.Role), "content": content}}, output...)
-	}
-	return output
-}
-
-func encodeAnthropicContent(blocks []canonicalBlock) []any {
+func encodeAnthropicBlocks(blocks []bridgeBlock) []any {
 	parts := make([]any, 0, len(blocks))
 	for _, block := range blocks {
-		switch block.Type {
+		switch block.Kind {
 		case "text":
 			parts = append(parts, map[string]any{"type": "text", "text": block.Text})
 		case "image":
 			if block.URL != "" {
 				parts = append(parts, map[string]any{"type": "image", "source": map[string]any{"type": "url", "url": block.URL}})
 			} else {
-				parts = append(parts, map[string]any{"type": "image", "source": map[string]any{"type": "base64", "media_type": block.Media, "data": block.Data}})
+				parts = append(parts, map[string]any{"type": "image", "source": map[string]any{"type": "base64", "media_type": block.MediaType, "data": block.Data}})
 			}
-		case "tool_use":
-			parts = append(parts, map[string]any{"type": "tool_use", "id": block.ID, "name": block.Name, "input": block.Input})
+		case "tool_call":
+			input := block.Arguments
+			if input == nil {
+				input = parseJSONOrString(block.ArgumentsJSON)
+			}
+			parts = append(parts, map[string]any{"type": "tool_use", "id": block.ID, "name": block.Name, "input": input})
 		case "tool_result":
-			parts = append(parts, map[string]any{"type": "tool_result", "tool_use_id": block.ToolID, "content": block.Content, "is_error": block.IsError})
+			parts = append(parts, map[string]any{"type": "tool_result", "tool_use_id": block.CallID, "content": block.Result, "is_error": block.IsError})
 		}
 	}
 	return parts
 }
 
+func bridgeArgumentsJSON(block bridgeBlock) string {
+	if block.ArgumentsJSON != "" {
+		return block.ArgumentsJSON
+	}
+	if block.Arguments == nil {
+		return "{}"
+	}
+	data, err := json.Marshal(block.Arguments)
+	if err != nil {
+		return "{}"
+	}
+	return string(data)
+}
+
+func bridgeToolResultContent(value any) string {
+	if text, ok := value.(string); ok {
+		return text
+	}
+	if parts, ok := value.([]any); ok {
+		var text strings.Builder
+		allText := true
+		for _, raw := range parts {
+			part, ok := raw.(map[string]any)
+			if !ok || stringAt(part, "type") != "text" {
+				allText = false
+				break
+			}
+			text.WriteString(stringAt(part, "text"))
+		}
+		if allText {
+			return text.String()
+		}
+	}
+	data, err := json.Marshal(value)
+	if err != nil {
+		return ""
+	}
+	return string(data)
+}
+
+func decodeChatToolChoice(value any) bridgeToolChoice {
+	if mode, ok := value.(string); ok {
+		return bridgeToolChoice{Mode: mode}
+	}
+	choice, _ := value.(map[string]any)
+	if stringAt(choice, "type") == "function" {
+		return bridgeToolChoice{Mode: "named", Name: stringAt(choice, "function", "name")}
+	}
+	return bridgeToolChoice{}
+}
+
+func decodeResponsesToolChoice(value any) bridgeToolChoice {
+	if mode, ok := value.(string); ok {
+		return bridgeToolChoice{Mode: mode}
+	}
+	choice, _ := value.(map[string]any)
+	if stringAt(choice, "type") == "function" {
+		return bridgeToolChoice{Mode: "named", Name: stringAt(choice, "name")}
+	}
+	return bridgeToolChoice{}
+}
+
+func decodeAnthropicToolChoice(value any) bridgeToolChoice {
+	choice, _ := value.(map[string]any)
+	switch stringAt(choice, "type") {
+	case "auto":
+		return bridgeToolChoice{Mode: "auto"}
+	case "none":
+		return bridgeToolChoice{Mode: "none"}
+	case "any":
+		return bridgeToolChoice{Mode: "required"}
+	case "tool":
+		return bridgeToolChoice{Mode: "named", Name: stringAt(choice, "name")}
+	default:
+		return bridgeToolChoice{}
+	}
+}
+
+func encodeChatToolChoice(choice bridgeToolChoice) any {
+	switch choice.Mode {
+	case "named":
+		return map[string]any{"type": "function", "function": map[string]any{"name": choice.Name}}
+	case "auto", "none", "required":
+		return choice.Mode
+	default:
+		return nil
+	}
+}
+
+func encodeResponsesToolChoice(choice bridgeToolChoice) any {
+	switch choice.Mode {
+	case "named":
+		return map[string]any{"type": "function", "name": choice.Name}
+	case "auto", "none", "required":
+		return choice.Mode
+	default:
+		return nil
+	}
+}
+
+func encodeAnthropicToolChoice(choice bridgeToolChoice) any {
+	switch choice.Mode {
+	case "named":
+		return map[string]any{"type": "tool", "name": choice.Name}
+	case "required":
+		return map[string]any{"type": "any"}
+	case "auto", "none":
+		return map[string]any{"type": choice.Mode}
+	default:
+		return nil
+	}
+}
+
 func convertResponse(from, to Protocol, body []byte) ([]byte, error) {
+	if from == to {
+		return append([]byte(nil), body...), nil
+	}
 	var input map[string]any
 	if err := json.Unmarshal(body, &input); err != nil {
 		return nil, err
 	}
-	response, err := decodeResponse(from, input)
+	response, err := decodeBridgeResponse(from, input)
 	if err != nil {
 		return nil, err
 	}
-	return json.Marshal(encodeResponse(to, response))
+	return json.Marshal(encodeBridgeResponse(to, response))
 }
 
-func decodeResponse(protocol Protocol, input map[string]any) (canonicalResponse, error) {
-	response := canonicalResponse{ID: stringAt(input, "id"), Model: stringAt(input, "model"), Created: int64At(input, "created")}
+func decodeBridgeResponse(protocol Protocol, input map[string]any) (bridgeResponse, error) {
+	response := bridgeResponse{
+		ID:      stringAt(input, "id"),
+		Model:   stringAt(input, "model"),
+		Created: int64At(input, "created"),
+	}
 	if response.Created == 0 {
 		response.Created = int64At(input, "created_at")
 	}
@@ -565,15 +837,20 @@ func decodeResponse(protocol Protocol, input map[string]any) (canonicalResponse,
 	case ProtocolChat:
 		choices := sliceAt(input, "choices")
 		if len(choices) == 0 {
-			return response, fmt.Errorf("chat response has no choices")
+			return response, fmt.Errorf("chat response contains no choices")
 		}
 		choice, _ := choices[0].(map[string]any)
-		message, _ := choice["message"].(map[string]any)
-		response.Text = blocksText(decodeOpenAIContent(message["content"]))
+		message := mapAt(choice, "message")
+		response.Text = bridgeBlocksText(decodeOpenAIBlocks(message["content"]))
 		for _, raw := range sliceAt(message, "tool_calls") {
 			call, _ := raw.(map[string]any)
-			fn, _ := call["function"].(map[string]any)
-			response.Tools = append(response.Tools, canonicalBlock{Type: "tool_use", ID: stringAt(call, "id"), Name: stringAt(fn, "name"), Input: parseJSONOrString(stringAt(fn, "arguments"))})
+			function := mapAt(call, "function")
+			response.Tools = append(response.Tools, bridgeBlock{
+				Kind:          "tool_call",
+				ID:            stringAt(call, "id"),
+				Name:          stringAt(function, "name"),
+				ArgumentsJSON: stringAt(function, "arguments"),
+			})
 		}
 		response.Stop = stringAt(choice, "finish_reason")
 		response.Usage = decodeOpenAIUsage(mapAt(input, "usage"))
@@ -582,33 +859,41 @@ func decodeResponse(protocol Protocol, input map[string]any) (canonicalResponse,
 			item, _ := raw.(map[string]any)
 			switch stringAt(item, "type") {
 			case "message":
-				response.Text += blocksText(decodeOpenAIContent(item["content"]))
+				response.Text += bridgeBlocksText(decodeOpenAIBlocks(item["content"]))
 			case "function_call":
-				response.Tools = append(response.Tools, canonicalBlock{Type: "tool_use", ID: stringAt(item, "call_id"), Name: stringAt(item, "name"), Input: parseJSONOrString(stringAt(item, "arguments"))})
+				response.Tools = append(response.Tools, bridgeBlock{
+					Kind:          "tool_call",
+					ID:            firstString(stringAt(item, "call_id"), stringAt(item, "id")),
+					Name:          stringAt(item, "name"),
+					ArgumentsJSON: stringAt(item, "arguments"),
+				})
 			}
 		}
 		response.Stop = "stop"
 		if len(response.Tools) > 0 {
 			response.Stop = "tool_calls"
 		}
+		if stringAt(input, "status") == "incomplete" {
+			response.Stop = "length"
+		}
 		response.Usage = decodeOpenAIUsage(mapAt(input, "usage"))
 	case ProtocolAnthropic:
-		for _, block := range decodeAnthropicContent(input["content"]) {
-			if block.Type == "text" {
+		for _, block := range decodeAnthropicBlocks(input["content"]) {
+			if block.Kind == "text" {
 				response.Text += block.Text
-			} else if block.Type == "tool_use" {
+			} else if block.Kind == "tool_call" {
 				response.Tools = append(response.Tools, block)
 			}
 		}
 		response.Stop = stringAt(input, "stop_reason")
 		response.Usage = decodeAnthropicUsage(mapAt(input, "usage"))
 	default:
-		return response, fmt.Errorf("unsupported response protocol")
+		return response, fmt.Errorf("unsupported response protocol %q", protocol)
 	}
 	return response, nil
 }
 
-func encodeResponse(protocol Protocol, response canonicalResponse) map[string]any {
+func encodeBridgeResponse(protocol Protocol, response bridgeResponse) map[string]any {
 	if response.ID == "" {
 		response.ID = randomID("resp", 12)
 	}
@@ -618,138 +903,159 @@ func encodeResponse(protocol Protocol, response canonicalResponse) map[string]an
 		if len(response.Tools) > 0 {
 			calls := make([]any, 0, len(response.Tools))
 			for _, tool := range response.Tools {
-				args, _ := json.Marshal(tool.Input)
-				calls = append(calls, map[string]any{"id": tool.ID, "type": "function", "function": map[string]any{"name": tool.Name, "arguments": string(args)}})
+				calls = append(calls, map[string]any{
+					"id":   tool.ID,
+					"type": "function",
+					"function": map[string]any{
+						"name":      tool.Name,
+						"arguments": bridgeArgumentsJSON(tool),
+					},
+				})
 			}
 			message["tool_calls"] = calls
 		}
-		return map[string]any{"id": asPrefix(response.ID, "chatcmpl"), "object": "chat.completion", "created": response.Created, "model": response.Model, "choices": []any{map[string]any{"index": 0, "message": message, "finish_reason": chatStop(response.Stop)}}, "usage": openAIUsage(response.Usage)}
+		return map[string]any{
+			"id":      asPrefix(response.ID, "chatcmpl"),
+			"object":  "chat.completion",
+			"created": response.Created,
+			"model":   response.Model,
+			"choices": []any{map[string]any{
+				"index":         0,
+				"message":       message,
+				"finish_reason": chatStop(response.Stop),
+			}},
+			"usage": openAIUsage(response.Usage),
+		}
 	case ProtocolResponses:
 		output := make([]any, 0, len(response.Tools)+1)
 		if response.Text != "" {
-			output = append(output, map[string]any{"id": randomID("msg", 12), "type": "message", "status": "completed", "role": "assistant", "content": []any{map[string]any{"type": "output_text", "text": response.Text, "annotations": []any{}}}})
+			output = append(output, map[string]any{
+				"id":     randomID("msg", 12),
+				"type":   "message",
+				"status": "completed",
+				"role":   "assistant",
+				"content": []any{map[string]any{
+					"type":        "output_text",
+					"text":        response.Text,
+					"annotations": []any{},
+				}},
+			})
 		}
 		for _, tool := range response.Tools {
-			args, _ := json.Marshal(tool.Input)
-			output = append(output, map[string]any{"id": randomID("fc", 12), "type": "function_call", "status": "completed", "call_id": tool.ID, "name": tool.Name, "arguments": string(args)})
+			output = append(output, map[string]any{
+				"id":        randomID("fc", 12),
+				"type":      "function_call",
+				"status":    "completed",
+				"call_id":   tool.ID,
+				"name":      tool.Name,
+				"arguments": bridgeArgumentsJSON(tool),
+			})
 		}
-		return map[string]any{"id": asPrefix(response.ID, "resp"), "object": "response", "created_at": response.Created, "status": "completed", "model": response.Model, "output": output, "usage": map[string]any{"input_tokens": response.Usage.Input, "output_tokens": response.Usage.Output, "total_tokens": response.Usage.Total, "input_tokens_details": map[string]any{"cached_tokens": response.Usage.Cached}, "output_tokens_details": map[string]any{"reasoning_tokens": response.Usage.Reasoning}}, "error": nil, "incomplete_details": nil}
+		return map[string]any{
+			"id":                 asPrefix(response.ID, "resp"),
+			"object":             "response",
+			"created_at":         response.Created,
+			"status":             "completed",
+			"model":              response.Model,
+			"output":             output,
+			"error":              nil,
+			"incomplete_details": nil,
+			"usage": map[string]any{
+				"input_tokens":  response.Usage.Input,
+				"output_tokens": response.Usage.Output,
+				"total_tokens":  response.Usage.Total,
+				"input_tokens_details": map[string]any{
+					"cached_tokens": response.Usage.Cached,
+				},
+				"output_tokens_details": map[string]any{
+					"reasoning_tokens": response.Usage.Reasoning,
+				},
+			},
+		}
 	case ProtocolAnthropic:
-		content := []any{}
+		content := make([]any, 0, len(response.Tools)+1)
 		if response.Text != "" {
 			content = append(content, map[string]any{"type": "text", "text": response.Text})
 		}
 		for _, tool := range response.Tools {
-			content = append(content, map[string]any{"type": "tool_use", "id": tool.ID, "name": tool.Name, "input": tool.Input})
+			input := tool.Arguments
+			if input == nil {
+				input = parseJSONOrString(tool.ArgumentsJSON)
+			}
+			content = append(content, map[string]any{"type": "tool_use", "id": tool.ID, "name": tool.Name, "input": input})
 		}
-		return map[string]any{"id": asPrefix(response.ID, "msg"), "type": "message", "role": "assistant", "model": response.Model, "content": content, "stop_reason": anthropicStop(response.Stop), "stop_sequence": nil, "usage": map[string]any{"input_tokens": response.Usage.Input, "output_tokens": response.Usage.Output, "cache_read_input_tokens": response.Usage.Cached}}
+		return map[string]any{
+			"id":            asPrefix(response.ID, "msg"),
+			"type":          "message",
+			"role":          "assistant",
+			"model":         response.Model,
+			"content":       content,
+			"stop_reason":   anthropicStop(response.Stop),
+			"stop_sequence": nil,
+			"usage": map[string]any{
+				"input_tokens":            response.Usage.Input,
+				"output_tokens":           response.Usage.Output,
+				"cache_read_input_tokens": response.Usage.Cached,
+			},
+		}
+	default:
+		return map[string]any{}
 	}
-	return map[string]any{}
 }
 
-func decodeOpenAIUsage(u map[string]any) canonicalUsage {
-	input := intAt(u, "prompt_tokens")
-	if input == 0 {
-		input = intAt(u, "input_tokens")
-	}
-	output := intAt(u, "completion_tokens")
-	if output == 0 {
-		output = intAt(u, "output_tokens")
-	}
-	total := intAt(u, "total_tokens")
+func decodeOpenAIUsage(usage map[string]any) bridgeUsage {
+	input := firstNonZero(intAt(usage, "prompt_tokens"), intAt(usage, "input_tokens"))
+	output := firstNonZero(intAt(usage, "completion_tokens"), intAt(usage, "output_tokens"))
+	total := intAt(usage, "total_tokens")
 	if total == 0 {
 		total = input + output
 	}
-	cached := intAt(u, "prompt_tokens_details", "cached_tokens")
-	if cached == 0 {
-		cached = intAt(u, "input_tokens_details", "cached_tokens")
-	}
-	reasoning := intAt(u, "completion_tokens_details", "reasoning_tokens")
-	if reasoning == 0 {
-		reasoning = intAt(u, "output_tokens_details", "reasoning_tokens")
-	}
-	return canonicalUsage{Input: input, Output: output, Total: total, Cached: cached, Reasoning: reasoning}
-}
-func decodeAnthropicUsage(u map[string]any) canonicalUsage {
-	input := intAt(u, "input_tokens")
-	output := intAt(u, "output_tokens")
-	cached := intAt(u, "cache_read_input_tokens")
-	return canonicalUsage{Input: input, Output: output, Total: input + output, Cached: cached}
-}
-func openAIUsage(u canonicalUsage) map[string]any {
-	return map[string]any{"prompt_tokens": u.Input, "completion_tokens": u.Output, "total_tokens": u.Total, "prompt_tokens_details": map[string]any{"cached_tokens": u.Cached}, "completion_tokens_details": map[string]any{"reasoning_tokens": u.Reasoning}}
+	cached := firstNonZero(intAt(usage, "prompt_tokens_details", "cached_tokens"), intAt(usage, "input_tokens_details", "cached_tokens"))
+	reasoning := firstNonZero(intAt(usage, "completion_tokens_details", "reasoning_tokens"), intAt(usage, "output_tokens_details", "reasoning_tokens"))
+	return bridgeUsage{Input: input, Output: output, Total: total, Cached: cached, Reasoning: reasoning}
 }
 
-func decodeChatToolChoice(v any) any {
-	m, _ := v.(map[string]any)
-	if stringAt(m, "type") == "function" {
-		return map[string]any{"name": stringAt(m, "function", "name")}
+func decodeAnthropicUsage(usage map[string]any) bridgeUsage {
+	input := intAt(usage, "input_tokens")
+	output := intAt(usage, "output_tokens")
+	return bridgeUsage{
+		Input:  input,
+		Output: output,
+		Total:  input + output,
+		Cached: intAt(usage, "cache_read_input_tokens"),
 	}
-	return v
-}
-func decodeResponsesToolChoice(v any) any {
-	m, _ := v.(map[string]any)
-	if stringAt(m, "type") == "function" {
-		return map[string]any{"name": stringAt(m, "name")}
-	}
-	return v
-}
-func decodeAnthropicToolChoice(v any) any {
-	m, _ := v.(map[string]any)
-	if stringAt(m, "type") == "tool" {
-		return map[string]any{"name": stringAt(m, "name")}
-	}
-	if s := stringAt(m, "type"); s != "" {
-		return s
-	}
-	return v
-}
-func encodeChatToolChoice(v any) any {
-	if m, ok := v.(map[string]any); ok {
-		return map[string]any{"type": "function", "function": map[string]any{"name": stringAt(m, "name")}}
-	}
-	return v
-}
-func encodeResponsesToolChoice(v any) any {
-	if m, ok := v.(map[string]any); ok {
-		return map[string]any{"type": "function", "name": stringAt(m, "name")}
-	}
-	return v
-}
-func encodeAnthropicToolChoice(v any) any {
-	if m, ok := v.(map[string]any); ok {
-		return map[string]any{"type": "tool", "name": stringAt(m, "name")}
-	}
-	if v == "required" {
-		return map[string]any{"type": "any"}
-	}
-	if v == "none" {
-		return map[string]any{"type": "none"}
-	}
-	if v == "auto" {
-		return map[string]any{"type": "auto"}
-	}
-	return v
 }
 
-func normalizeChatRole(role string) string {
-	if role == "developer" {
-		return "system"
+func openAIUsage(usage bridgeUsage) map[string]any {
+	return map[string]any{
+		"prompt_tokens":     usage.Input,
+		"completion_tokens": usage.Output,
+		"total_tokens":      usage.Total,
+		"prompt_tokens_details": map[string]any{
+			"cached_tokens": usage.Cached,
+		},
+		"completion_tokens_details": map[string]any{
+			"reasoning_tokens": usage.Reasoning,
+		},
 	}
-	return role
 }
+
+func firstNonZero(values ...int) int {
+	for _, value := range values {
+		if value != 0 {
+			return value
+		}
+	}
+	return 0
+}
+
 func normalizeResponsesRole(role string) string {
-	if role == "tool" {
-		return "user"
-	}
-	return role
-}
-func normalizeAnthropicRole(role string) string {
 	if role == "assistant" {
-		return role
+		return "assistant"
 	}
 	return "user"
 }
+
 func chatStop(stop string) string {
 	switch stop {
 	case "tool_use", "tool_calls":
@@ -760,6 +1066,7 @@ func chatStop(stop string) string {
 		return "stop"
 	}
 }
+
 func anthropicStop(stop string) string {
 	switch stop {
 	case "tool_use", "tool_calls":
@@ -770,114 +1077,125 @@ func anthropicStop(stop string) string {
 		return "end_turn"
 	}
 }
-func schemaOrDefault(v any) any {
-	if v == nil {
+
+func schemaOrDefault(value any) any {
+	if value == nil {
 		return map[string]any{"type": "object", "properties": map[string]any{}}
 	}
-	return v
+	return value
 }
-func reasoningEffort(v any) any {
-	if m, ok := v.(map[string]any); ok {
-		return firstAny(m["effort"], m["type"])
+
+func reasoningEffort(value any) any {
+	if object, ok := value.(map[string]any); ok {
+		return firstAny(object["effort"], object["type"])
 	}
-	return v
+	return value
 }
-func blocksText(blocks []canonicalBlock) string {
-	var b strings.Builder
+
+func bridgeBlocksText(blocks []bridgeBlock) string {
+	var text strings.Builder
 	for _, block := range blocks {
-		if block.Type == "text" {
-			b.WriteString(block.Text)
+		if block.Kind == "text" {
+			text.WriteString(block.Text)
 		}
 	}
-	return b.String()
+	return text.String()
 }
-func contentString(v any) string {
-	if s, ok := v.(string); ok {
-		return s
-	}
-	data, _ := json.Marshal(v)
-	return string(data)
-}
-func parseJSONOrString(v string) any {
-	if v == "" {
+
+func parseJSONOrString(value string) any {
+	if value == "" {
 		return map[string]any{}
 	}
-	var out any
-	if json.Unmarshal([]byte(v), &out) == nil {
-		return out
+	var decoded any
+	if json.Unmarshal([]byte(value), &decoded) == nil {
+		return decoded
 	}
-	return v
+	return value
 }
+
 func asPrefix(id, prefix string) string {
 	if strings.HasPrefix(id, prefix+"_") {
 		return id
 	}
-	return prefix + "_" + strings.TrimPrefix(id, "resp_")
+	for _, current := range []string{"chatcmpl_", "resp_", "msg_"} {
+		id = strings.TrimPrefix(id, current)
+	}
+	return prefix + "_" + id
 }
-func put(m map[string]any, k string, v any) {
-	if v != nil {
-		m[k] = v
+
+func put(object map[string]any, key string, value any) {
+	if value != nil {
+		object[key] = value
 	}
 }
+
 func firstAny(values ...any) any {
-	for _, v := range values {
-		if v != nil {
-			return v
+	for _, value := range values {
+		if value != nil {
+			return value
 		}
 	}
 	return nil
 }
-func cloneMap(in map[string]any) map[string]any {
-	data, _ := json.Marshal(in)
-	var out map[string]any
-	_ = json.Unmarshal(data, &out)
-	return out
+
+func cloneMap(input map[string]any) map[string]any {
+	data, _ := json.Marshal(input)
+	var output map[string]any
+	_ = json.Unmarshal(data, &output)
+	return output
 }
-func asSlice(v any) []any {
-	if values, ok := v.([]any); ok {
+
+func asSlice(value any) []any {
+	if values, ok := value.([]any); ok {
 		return values
 	}
-	if v == nil {
+	if value == nil {
 		return nil
 	}
-	return []any{v}
+	return []any{value}
 }
-func sliceAt(m map[string]any, path ...string) []any {
-	v := anyAt(m, path...)
-	values, _ := v.([]any)
+
+func sliceAt(object map[string]any, path ...string) []any {
+	values, _ := anyAt(object, path...).([]any)
 	return values
 }
-func mapAt(m map[string]any, path ...string) map[string]any {
-	v := anyAt(m, path...)
-	value, _ := v.(map[string]any)
+
+func mapAt(object map[string]any, path ...string) map[string]any {
+	value, _ := anyAt(object, path...).(map[string]any)
 	return value
 }
-func stringAt(m map[string]any, path ...string) string {
-	v := anyAt(m, path...)
-	value, _ := v.(string)
+
+func stringAt(object map[string]any, path ...string) string {
+	value, _ := anyAt(object, path...).(string)
 	return value
 }
-func boolAt(m map[string]any, path ...string) bool {
-	v := anyAt(m, path...)
-	value, _ := v.(bool)
+
+func boolAt(object map[string]any, path ...string) bool {
+	value, _ := anyAt(object, path...).(bool)
 	return value
 }
-func intAt(m map[string]any, path ...string) int {
-	v := anyAt(m, path...)
-	switch n := v.(type) {
+
+func intAt(object map[string]any, path ...string) int {
+	value := anyAt(object, path...)
+	switch number := value.(type) {
 	case float64:
-		return int(n)
+		return int(number)
 	case int:
-		return n
+		return number
 	case json.Number:
-		i, _ := n.Int64()
-		return int(i)
+		integer, _ := number.Int64()
+		return int(integer)
+	default:
+		return 0
 	}
-	return 0
 }
-func int64At(m map[string]any, path ...string) int64 { return int64(intAt(m, path...)) }
-func anyAt(m map[string]any, path ...string) any {
-	var current any = m
+
+func int64At(object map[string]any, path ...string) int64 {
+	return int64(intAt(object, path...))
+}
+
+func anyAt(object map[string]any, path ...string) any {
+	var current any = object
 	for _, key := range path {
 		next, ok := current.(map[string]any)
 		if !ok {
