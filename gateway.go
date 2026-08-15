@@ -30,6 +30,7 @@ type Gateway struct {
 	zenNodes   *nodePool
 	goNodes    *nodePool
 	catalog    *modelCatalog
+	monitor    *Monitor
 }
 
 type healthResponse struct {
@@ -64,8 +65,8 @@ type healthProxies struct {
 	Unhealthy int `json:"unhealthy"`
 }
 
-func NewGateway(cfg Config, logger *slog.Logger) (*Gateway, error) {
-	transports, err := newTransportPool(cfg.Proxies, cfg.Performance, time.Duration(cfg.Retry.TimeoutSeconds)*time.Second)
+func NewGateway(cfg Config, logger *slog.Logger, monitor *Monitor) (*Gateway, error) {
+	transports, err := newTransportPool(cfg.RuntimeProxies(), cfg.Performance, time.Duration(cfg.Retry.TimeoutSeconds)*time.Second)
 	if err != nil {
 		return nil, err
 	}
@@ -85,6 +86,7 @@ func NewGateway(cfg Config, logger *slog.Logger) (*Gateway, error) {
 		zenNodes:   zenNodes,
 		goNodes:    goNodes,
 		catalog:    newModelCatalog(cfg.Prefer, cfg.Models.Protocols),
+		monitor:    monitor,
 	}, nil
 }
 
@@ -212,6 +214,10 @@ func (g *Gateway) handleInference(external Protocol) http.HandlerFunc {
 			return
 		}
 		model := stringAt(payload, "model")
+		meta := metaFromRequest(r)
+		if meta != nil {
+			meta.Model = model
+		}
 		if model == "" {
 			writeAPIError(w, external, http.StatusBadRequest, "model is required", "invalid_request_error", "model")
 			return
@@ -224,6 +230,9 @@ func (g *Gateway) handleInference(external Protocol) http.HandlerFunc {
 		if err != nil {
 			writeAPIError(w, external, http.StatusBadRequest, err.Error(), "invalid_request_error", "model")
 			return
+		}
+		if meta != nil {
+			meta.Tier = string(route.Tier)
 		}
 		upstreamURL := g.cfg.Upstream.Zen
 		if route.Tier == TierGo {
@@ -240,12 +249,15 @@ func (g *Gateway) handleInference(external Protocol) http.HandlerFunc {
 			return
 		}
 		ids := deriveRequestIDs(r, payload)
+		if meta != nil {
+			meta.Request = ids.Request
+		}
 		stream := boolAt(payload, "stream")
 		requestCtx, cancel := context.WithTimeout(r.Context(), time.Duration(g.cfg.Retry.TimeoutSeconds)*time.Second)
 		defer cancel()
 		resp, err := g.doUpstream(requestCtx, route, encoded, ids)
 		if err != nil {
-			g.logger.Warn("upstream request failed", "request_id", ids.Request, "tier", route.Tier, "error", err)
+			g.logger.Warn("all upstream attempts failed", "component", "upstream", "event", "request_failed", "request_id", ids.Request, "tier", route.Tier, "error", err)
 			writeAPIError(w, external, http.StatusBadGateway, "all upstream attempts failed", "upstream_error", ids.Request)
 			return
 		}
@@ -256,6 +268,13 @@ func (g *Gateway) handleInference(external Protocol) http.HandlerFunc {
 			return
 		}
 		if stream {
+			if meta != nil {
+				meta.Stream = true
+			}
+			if g.monitor != nil {
+				g.monitor.activeStreams.Add(1)
+				defer g.monitor.activeStreams.Add(-1)
+			}
 			w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 			w.Header().Set("Cache-Control", "no-cache")
 			w.Header().Set("X-Accel-Buffering", "no")
@@ -266,7 +285,7 @@ func (g *Gateway) handleInference(external Protocol) http.HandlerFunc {
 				err = transcodeStream(w, resp.Body, route.Protocol, external, model)
 			}
 			if err != nil && !errors.Is(err, context.Canceled) {
-				g.logger.Debug("stream ended with error", "request_id", ids.Request, "error", err)
+				g.logger.Debug("downstream stream ended with an error", "component", "stream", "event", "stream_failed", "request_id", ids.Request, "model", model, "tier", route.Tier, "error", err)
 			}
 			return
 		}
@@ -278,7 +297,7 @@ func (g *Gateway) handleInference(external Protocol) http.HandlerFunc {
 		if external != route.Protocol {
 			responseBody, err = convertResponse(route.Protocol, external, responseBody)
 			if err != nil {
-				g.logger.Warn("response conversion failed", "request_id", ids.Request, "error", err)
+				g.logger.Warn("response protocol conversion failed", "component", "conversion", "event", "response_conversion_failed", "request_id", ids.Request, "model", model, "source_protocol", route.Protocol, "target_protocol", external, "error", err)
 				writeAPIError(w, external, http.StatusBadGateway, "unsupported upstream response", "upstream_error", ids.Request)
 				return
 			}
@@ -303,6 +322,11 @@ func (g *Gateway) doUpstream(ctx context.Context, route modelRoute, body []byte,
 		return nil, fmt.Errorf("no %s nodes configured", route.Tier)
 	}
 	for attempt := 1; attempt <= g.cfg.Retry.MaxAttempts; attempt++ {
+		// Attempts are exposed only as aggregate request metadata and never
+		// include the selected credential.
+		if meta, _ := ctx.Value(requestMetaKey{}).(*requestMeta); meta != nil {
+			meta.Attempts = attempt
+		}
 		node := cursor.Next()
 		if node == nil {
 			break
@@ -334,7 +358,9 @@ func (g *Gateway) doUpstream(ctx context.Context, route modelRoute, body []byte,
 		} else {
 			req.Header.Set("Authorization", "Bearer "+node.key)
 		}
+		attemptStarted := time.Now()
 		resp, err := proxy.client.Do(req)
+		attemptDuration := time.Since(attemptStarted)
 		status := 0
 		if resp != nil {
 			status = resp.StatusCode
@@ -342,7 +368,7 @@ func (g *Gateway) doUpstream(ctx context.Context, route modelRoute, body []byte,
 		proxyFailed := g.syncProxyResult(ctx, proxy, status, err)
 		if err == nil && resp.StatusCode/100 == 2 {
 			nodes.MarkSuccess(node)
-			g.logger.Debug("upstream accepted request", "request_id", ids.Request, "attempt", attempt, "tier", route.Tier, "proxy", redactURL(proxy.name))
+			g.logger.Debug("upstream accepted request", "component", "upstream", "event", "attempt_succeeded", "request_id", ids.Request, "attempt", attempt, "tier", route.Tier, "key_id", secretFingerprint(node.key), "proxy", redactURL(proxy.name), "status", resp.StatusCode, "duration_ms", attemptDuration.Milliseconds())
 			return resp, nil
 		}
 		// Request-shape errors are deterministic and must be returned to the
@@ -350,7 +376,7 @@ func (g *Gateway) doUpstream(ctx context.Context, route modelRoute, body []byte,
 		// throttling, server, and transport failures remain retryable.
 		if err == nil && resp.StatusCode >= 400 && resp.StatusCode < 500 && resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusTooManyRequests {
 			nodes.MarkSuccess(node)
-			g.logger.Debug("upstream rejected request without retry", "request_id", ids.Request, "attempt", attempt, "status", resp.StatusCode, "proxy", redactURL(proxy.name))
+			g.logger.Debug("upstream rejected a non-retryable request", "component", "upstream", "event", "attempt_rejected", "request_id", ids.Request, "attempt", attempt, "tier", route.Tier, "key_id", secretFingerprint(node.key), "status", resp.StatusCode, "proxy", redactURL(proxy.name), "duration_ms", attemptDuration.Milliseconds())
 			return resp, nil
 		}
 		if proxyFailed {
@@ -363,9 +389,9 @@ func (g *Gateway) doUpstream(ctx context.Context, route modelRoute, body []byte,
 		lastResponse = resp
 		lastErr = err
 		if err != nil {
-			g.logger.Debug("upstream transport error", "request_id", ids.Request, "attempt", attempt, "proxy", redactURL(proxy.name), "error", err)
+			g.logger.Debug("upstream transport attempt failed", "component", "upstream", "event", "attempt_transport_failed", "request_id", ids.Request, "attempt", attempt, "tier", route.Tier, "key_id", secretFingerprint(node.key), "proxy", redactURL(proxy.name), "duration_ms", attemptDuration.Milliseconds(), "error", err)
 		} else {
-			g.logger.Debug("upstream rejected request", "request_id", ids.Request, "attempt", attempt, "status", resp.StatusCode, "proxy", redactURL(proxy.name))
+			g.logger.Debug("upstream returned a retryable response", "component", "upstream", "event", "attempt_retryable_response", "request_id", ids.Request, "attempt", attempt, "tier", route.Tier, "key_id", secretFingerprint(node.key), "status", resp.StatusCode, "proxy", redactURL(proxy.name), "duration_ms", attemptDuration.Milliseconds())
 		}
 	}
 	if lastResponse != nil {
@@ -428,7 +454,7 @@ func (g *Gateway) rebindUnavailableProxy(proxy *proxyTransport, wasHealthy bool)
 	zenMoved = g.zenNodes.RebindProxy(proxy.index)
 	goMoved = g.goNodes.RebindProxy(proxy.index)
 	if wasHealthy || zenMoved+goMoved > 0 {
-		g.logger.Warn("proxy unavailable", "proxy", redactURL(proxy.name), "zen_keys_moved", zenMoved, "go_keys_moved", goMoved)
+		g.logger.Warn("proxy became unavailable", "component", "proxy", "event", "proxy_unavailable", "proxy", redactURL(proxy.name), "zen_keys_moved", zenMoved, "go_keys_moved", goMoved)
 	}
 	return zenMoved, goMoved
 }
@@ -440,7 +466,7 @@ func (g *Gateway) restoreProxy(proxy *proxyTransport) (zenMoved, goMoved int) {
 	zenMoved = g.zenNodes.RestoreProxy(proxy.index)
 	goMoved = g.goNodes.RestoreProxy(proxy.index)
 	if zenMoved+goMoved > 0 {
-		g.logger.Info("proxy restored", "proxy", redactURL(proxy.name), "zen_keys_moved", zenMoved, "go_keys_moved", goMoved)
+		g.logger.Info("proxy connectivity restored", "component", "proxy", "event", "proxy_restored", "proxy", redactURL(proxy.name), "zen_keys_moved", zenMoved, "go_keys_moved", goMoved)
 	}
 	return zenMoved, goMoved
 }
@@ -471,21 +497,21 @@ func (g *Gateway) applyProxyHealthResult(result proxyHealthResult, source string
 		if !result.wasHealthy {
 			g.restoreProxy(result.proxy)
 		}
-		g.logger.Debug("proxy health check passed", "source", source, "upstream_status", upstreamStatus, "proxy", redactURL(result.proxy.name))
+		g.logger.Debug("proxy health check passed", "component", "proxy", "event", "health_check_passed", "source", source, "upstream_status", upstreamStatus, "proxy", redactURL(result.proxy.name))
 		return
 	}
 	if !result.failed {
-		g.logger.Debug("proxy health check inconclusive", "source", source, "upstream_status", upstreamStatus, "proxy", redactURL(result.proxy.name), "error", result.err)
+		g.logger.Debug("proxy health check was inconclusive", "component", "proxy", "event", "health_check_inconclusive", "source", source, "upstream_status", upstreamStatus, "proxy", redactURL(result.proxy.name), "error", result.err)
 		return
 	}
 	if g.transports.hasHealthy() {
 		zenMoved, goMoved := g.rebindUnavailableProxy(result.proxy, result.wasHealthy)
 		if result.wasHealthy || zenMoved+goMoved > 0 {
-			g.logger.Warn("proxy health check failed", "source", source, "upstream_status", upstreamStatus, "proxy", redactURL(result.proxy.name), "zen_keys_moved", zenMoved, "go_keys_moved", goMoved, "error", result.err)
+			g.logger.Warn("proxy health check failed", "component", "proxy", "event", "health_check_failed", "source", source, "upstream_status", upstreamStatus, "proxy", redactURL(result.proxy.name), "zen_keys_moved", zenMoved, "go_keys_moved", goMoved, "error", result.err)
 			return
 		}
 	}
-	g.logger.Debug("proxy health check still failing", "source", source, "upstream_status", upstreamStatus, "proxy", redactURL(result.proxy.name), "error", result.err)
+	g.logger.Debug("proxy health check is still failing", "component", "proxy", "event", "health_check_still_failing", "source", source, "upstream_status", upstreamStatus, "proxy", redactURL(result.proxy.name), "error", result.err)
 }
 
 func protocolPath(protocol Protocol) string {
@@ -509,7 +535,7 @@ func (g *Gateway) StartModelRefresh(ctx context.Context) {
 		wg.Wait()
 		if zen != nil || goModels != nil {
 			g.catalog.Replace(zen, goModels)
-			g.logger.Info("model catalog refreshed", "models", len(g.catalog.List()))
+			g.logger.Info("model catalog refreshed", "component", "models", "event", "catalog_refreshed", "models", len(g.catalog.List()))
 		}
 	}
 	go func() {
@@ -548,9 +574,9 @@ func (g *Gateway) refreshTier(ctx context.Context, base string, nodes *nodePool)
 			return models
 		}
 		nodes.MarkFailure(node, nil, err)
-		g.logger.Debug("model refresh attempt failed", "upstream", base, "attempt", attempt+1, "error", err)
+		g.logger.Debug("model catalog refresh attempt failed", "component", "models", "event", "refresh_attempt_failed", "upstream", redactURL(base), "attempt", attempt+1, "error", err)
 	}
-	g.logger.Warn("model refresh failed", "upstream", base)
+	g.logger.Warn("model catalog refresh failed", "component", "models", "event", "refresh_failed", "upstream", redactURL(base))
 	return nil
 }
 
@@ -593,7 +619,7 @@ func recoveryMiddleware(logger *slog.Logger, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
 			if value := recover(); value != nil {
-				logger.Error("request panic", "error", value)
+				logger.Error("request handler panicked", "component", "http", "event", "request_panic", "error", value)
 				writeAPIError(w, ProtocolChat, http.StatusInternalServerError, "internal server error", "server_error", "")
 			}
 		}()

@@ -48,11 +48,11 @@ type modelCatalog struct {
 }
 
 type modelCatalogSnapshot struct {
-	Zen       int
-	Go        int
-	Total     int
-	Exposed   int
-	UpdatedAt time.Time
+	Zen       int       `json:"zen"`
+	Go        int       `json:"go"`
+	Total     int       `json:"total"`
+	Exposed   int       `json:"exposed"`
+	UpdatedAt time.Time `json:"updated_at,omitempty"`
 }
 
 func newModelCatalog(prefer Tier, overrides map[string]string) *modelCatalog {
@@ -73,6 +73,26 @@ func (c *modelCatalog) Replace(zen, goModels []string) {
 		c.goModels = toSet(goModels)
 	}
 	c.updatedAt = time.Now()
+}
+
+func (c *modelCatalog) CopyState(source *modelCatalog) {
+	if source == nil {
+		return
+	}
+	source.mu.RLock()
+	zen := make(map[string]bool, len(source.zen))
+	goModels := make(map[string]bool, len(source.goModels))
+	for model, available := range source.zen {
+		zen[model] = available
+	}
+	for model, available := range source.goModels {
+		goModels[model] = available
+	}
+	updatedAt := source.updatedAt
+	source.mu.RUnlock()
+	c.mu.Lock()
+	c.zen, c.goModels, c.updatedAt = zen, goModels, updatedAt
+	c.mu.Unlock()
 }
 
 func (c *modelCatalog) Route(model string, hasZenKeys, hasGoKeys bool) (modelRoute, error) {

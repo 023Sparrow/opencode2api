@@ -27,6 +27,14 @@
     "failure_cooldown_seconds": 15
   },
   "logging": {
-    "level": "info"
+    "level": "info",
+    "ring_size": 2000
+  },
+  "webui": {
+    "enabled": true,
+    "listen": "0.0.0.0:8081",
+    "username": "admin",
+    "password": "change-this-admin-password",
+    "session_ttl_minutes": 720
   }
 }

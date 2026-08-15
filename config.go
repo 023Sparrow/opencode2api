@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 )
 
@@ -25,7 +26,10 @@ type Config struct {
 	Models      ModelsConfig      `json:"models"`
 	Performance PerformanceConfig `json:"performance"`
 	Logging     LoggingConfig     `json:"logging"`
+	WebUI       WebUIConfig       `json:"webui"`
 	Prefer      Tier              `json:"prefer"`
+
+	effectiveProxies []string
 }
 
 type UpstreamConfig struct {
@@ -44,7 +48,17 @@ type ModelsConfig struct {
 }
 
 type LoggingConfig struct {
-	Level string `json:"level"`
+	Level    string `json:"level"`
+	RingSize int    `json:"ring_size"`
+}
+
+type WebUIConfig struct {
+	Enabled           bool   `json:"enabled"`
+	Listen            string `json:"listen"`
+	Username          string `json:"username"`
+	Password          string `json:"password,omitempty"`
+	PasswordHash      string `json:"password_hash,omitempty"`
+	SessionTTLMinutes int    `json:"session_ttl_minutes"`
 }
 
 type PerformanceConfig struct {
@@ -71,7 +85,8 @@ func LoadConfig(path string) (Config, error) {
 		Retry:       RetryConfig{MaxAttempts: 3, TimeoutSeconds: 300},
 		Models:      ModelsConfig{RefreshSeconds: 300, Protocols: map[string]string{}},
 		Performance: PerformanceConfig{MaxIdleConns: 2048, MaxIdleConnsPerHost: 256, MaxConnsPerHost: 0, IdleConnTimeoutSeconds: 120, ConnectTimeoutSeconds: 5, FailureCooldownSeconds: 15},
-		Logging:     LoggingConfig{Level: "info"},
+		Logging:     LoggingConfig{Level: "info", RingSize: 2000},
+		WebUI:       WebUIConfig{Listen: "0.0.0.0:8081", SessionTTLMinutes: 720},
 		Prefer:      TierGo,
 	}
 	dec := json.NewDecoder(bytes.NewReader(data))
@@ -82,11 +97,17 @@ func LoadConfig(path string) (Config, error) {
 	if err := ensureJSONEOF(dec); err != nil {
 		return Config{}, fmt.Errorf("parse %s: %w", path, err)
 	}
+	return NormalizeConfig(path, cfg)
+}
+
+// NormalizeConfig resolves external inputs and validates a Config supplied by
+// either the JSON file or the authenticated management API.
+func NormalizeConfig(path string, cfg Config) (Config, error) {
 	trimList(&cfg.ServerKeys)
 	trimList(&cfg.ZenKeys)
 	trimList(&cfg.GoKeys)
 	cfg.ProxyFile = strings.TrimSpace(cfg.ProxyFile)
-	if err := loadProxyFiles(path, &cfg); err != nil {
+	if err := resolveProxyFiles(path, &cfg); err != nil {
 		return Config{}, err
 	}
 	if cfg.Prefer != TierZen && cfg.Prefer != TierGo {
@@ -101,9 +122,6 @@ func LoadConfig(path string) (Config, error) {
 	if len(cfg.ZenKeys) == 0 && len(cfg.GoKeys) == 0 {
 		return Config{}, errors.New("zen_keys or go_keys must contain at least one upstream key")
 	}
-	if len(cfg.Proxies) == 0 {
-		cfg.Proxies = []string{"direct"}
-	}
 	if cfg.Retry.MaxAttempts < 1 {
 		return Config{}, errors.New("retry.max_attempts must be at least 1")
 	}
@@ -116,7 +134,32 @@ func LoadConfig(path string) (Config, error) {
 	if cfg.Performance.MaxIdleConns < 1 || cfg.Performance.MaxIdleConnsPerHost < 1 || cfg.Performance.MaxConnsPerHost < 0 || cfg.Performance.IdleConnTimeoutSeconds < 1 || cfg.Performance.ConnectTimeoutSeconds < 1 || cfg.Performance.FailureCooldownSeconds < 1 {
 		return Config{}, errors.New("performance values must be positive (max_conns_per_host may be zero for unlimited)")
 	}
-	for _, raw := range cfg.Proxies {
+	if cfg.Logging.Level != "debug" && cfg.Logging.Level != "info" && cfg.Logging.Level != "warn" && cfg.Logging.Level != "error" {
+		return Config{}, errors.New("logging.level must be debug, info, warn, or error")
+	}
+	if cfg.Logging.RingSize < 100 || cfg.Logging.RingSize > 50000 {
+		return Config{}, errors.New("logging.ring_size must be between 100 and 50000")
+	}
+	if cfg.WebUI.Password != "" && len(cfg.WebUI.Password) < 10 {
+		return Config{}, errors.New("webui.password must contain at least 10 characters")
+	}
+	if cfg.WebUI.Enabled {
+		cfg.WebUI.Listen = strings.TrimSpace(cfg.WebUI.Listen)
+		cfg.WebUI.Username = strings.TrimSpace(cfg.WebUI.Username)
+		if cfg.WebUI.Listen == "" {
+			return Config{}, errors.New("webui.listen must not be empty when webui is enabled")
+		}
+		if cfg.WebUI.Username == "" {
+			return Config{}, errors.New("webui.username must not be empty when webui is enabled")
+		}
+		if cfg.WebUI.Password == "" && cfg.WebUI.PasswordHash == "" {
+			return Config{}, errors.New("webui.password is required for first-time setup")
+		}
+		if cfg.WebUI.SessionTTLMinutes < 5 || cfg.WebUI.SessionTTLMinutes > 10080 {
+			return Config{}, errors.New("webui.session_ttl_minutes must be between 5 and 10080")
+		}
+	}
+	for _, raw := range cfg.RuntimeProxies() {
 		if raw == "direct" {
 			continue
 		}
@@ -136,6 +179,19 @@ func LoadConfig(path string) (Config, error) {
 		}
 	}
 	return cfg, nil
+}
+
+// RuntimeProxies returns the resolved proxy list, including proxyfile entries.
+// Config.Proxies intentionally remains the list stored in config.json so a
+// save never duplicates values loaded from proxyfile.
+func (cfg Config) RuntimeProxies() []string {
+	if len(cfg.effectiveProxies) > 0 {
+		return cfg.effectiveProxies
+	}
+	if len(cfg.Proxies) > 0 {
+		return cfg.Proxies
+	}
+	return []string{"direct"}
 }
 
 func ensureJSONEOF(dec *json.Decoder) error {
@@ -217,8 +273,9 @@ func stripJSONComments(data []byte) ([]byte, error) {
 	return out, nil
 }
 
-func loadProxyFiles(configPath string, cfg *Config) error {
+func resolveProxyFiles(configPath string, cfg *Config) error {
 	trimList(&cfg.Proxies)
+	effective := append([]string(nil), cfg.Proxies...)
 	if cfg.ProxyFile != "" {
 		resolved := cfg.ProxyFile
 		if !filepath.IsAbs(resolved) {
@@ -228,14 +285,104 @@ func loadProxyFiles(configPath string, cfg *Config) error {
 		if err != nil {
 			return fmt.Errorf("load proxy file %s: %w", resolved, err)
 		}
-		cfg.Proxies = append(cfg.Proxies, proxies...)
+		effective = append(effective, proxies...)
 	}
 
-	cfg.Proxies = uniqueStrings(cfg.Proxies)
-	if len(cfg.Proxies) == 0 {
-		cfg.Proxies = []string{"direct"}
+	effective = uniqueStrings(effective)
+	if len(effective) == 0 {
+		effective = []string{"direct"}
+	}
+	cfg.effectiveProxies = effective
+	return nil
+}
+
+// SaveConfigAtomic writes normalized JSON and keeps the preceding file as
+// config.json.bak. The temporary file is created beside the target so the
+// final rename stays on the same filesystem.
+func SaveConfigAtomic(path string, cfg Config) error {
+	cfg.PasswordForSave()
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode config: %w", err)
+	}
+	data = append(data, '\n')
+	dir := filepath.Dir(path)
+	temp, err := os.CreateTemp(dir, ".config-*.tmp")
+	if err != nil {
+		return fmt.Errorf("create temporary config: %w", err)
+	}
+	tempPath := temp.Name()
+	defer os.Remove(tempPath)
+	if _, err = temp.Write(data); err == nil {
+		err = temp.Sync()
+	}
+	closeErr := temp.Close()
+	if err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return fmt.Errorf("write temporary config: %w", err)
+	}
+	if info, statErr := os.Stat(path); statErr == nil {
+		_ = os.Chmod(tempPath, info.Mode().Perm())
+	}
+
+	backup := path + ".bak"
+	if runtime.GOOS == "windows" {
+		_ = os.Remove(backup)
+		if _, statErr := os.Stat(path); statErr == nil {
+			if err := os.Rename(path, backup); err != nil {
+				return fmt.Errorf("backup config: %w", err)
+			}
+		}
+		if err := os.Rename(tempPath, path); err != nil {
+			_ = os.Rename(backup, path)
+			return fmt.Errorf("replace config: %w", err)
+		}
+		return nil
+	}
+	if _, statErr := os.Stat(path); statErr == nil {
+		if err := copyFile(path, backup); err != nil {
+			return fmt.Errorf("backup config: %w", err)
+		}
+	}
+	if err := os.Rename(tempPath, path); err != nil {
+		return fmt.Errorf("replace config: %w", err)
 	}
 	return nil
+}
+
+// PasswordForSave ensures resolved-only data is excluded. The method is kept
+// separate to make accidental persistence of effective proxy values obvious.
+func (cfg *Config) PasswordForSave() {
+	cfg.effectiveProxies = nil
+}
+
+func copyFile(source, target string) error {
+	in, err := os.Open(source)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	mode := os.FileMode(0600)
+	if info, statErr := in.Stat(); statErr == nil {
+		mode = info.Mode().Perm()
+	}
+	out, err := os.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, mode)
+	if err != nil {
+		return err
+	}
+	_ = out.Chmod(mode)
+	_, copyErr := io.Copy(out, in)
+	syncErr := out.Sync()
+	closeErr := out.Close()
+	if copyErr != nil {
+		return copyErr
+	}
+	if syncErr != nil {
+		return syncErr
+	}
+	return closeErr
 }
 
 func readProxyFile(path string) ([]string, error) {

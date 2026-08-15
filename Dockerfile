@@ -7,6 +7,6 @@ WORKDIR /app
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint
 RUN chmod 0755 /usr/local/bin/docker-entrypoint
 
-EXPOSE 8080
+EXPOSE 8080 8081
 
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint"]

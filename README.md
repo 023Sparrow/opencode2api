@@ -18,6 +18,10 @@
 - 代理失败后自动迁移绑定，key 失败后进行短时冷却
 - 根据真实上游流量识别代理故障，并每 15 分钟通过 Cloudflare trace 并行复查异常代理
 - 为不同会话生成不同的 OpenCode 会话 ID，并支持 `x-opencode-session`、`x-session-id` 和 `conversation-id` 显式指定会话
+- 内置独立端口 WebUI，可管理配置、查看运行指标、key/proxy 状态与实时日志
+- WebUI 使用账号密码、服务端 session、HttpOnly Cookie、CSRF 与登录限速保护
+- WebUI 保存后原子写入配置并热切换 Gateway；无效配置不会影响当前流量
+- stdout 输出结构化 JSON 日志，最近事件与一小时滚动指标保存在有限内存中
 
 ## API 路径
 
@@ -32,6 +36,18 @@
 `/healthz` 无需 API key，返回服务版本以及模型目录、Zen/Go key 和代理池的汇总状态，不会暴露 key 或代理地址。模型目录尚未完成首次刷新、已经过期、没有可暴露模型或没有健康代理时返回 HTTP `503`；其余情况返回 `200`。
 
 模型目录的过期阈值为 `models.refresh_seconds` 的两倍，且不低于 60 秒。刚启动时短暂返回 `503 starting` 属于正常现象，模型列表首次刷新成功后会变为 `200 ok`。
+
+## WebUI
+
+示例配置会在独立的 `8081` 端口启动管理界面：
+
+```text
+http://服务器地址:8081
+```
+
+首次账号为 `admin`，密码来自 `webui.password`。服务第一次成功启动时会使用 Argon2id 将密码转换为带盐哈希，写入 `webui.password_hash`，并从配置中删除明文密码。请在首次登录后立即修改示例密码。
+
+WebUI 可查看最近一小时的请求率、成功率、状态码与延迟分位，监控活跃请求/流、模型、key 冷却和 proxy 健康状态；实时日志通过 SSE 推送。监控和最近日志仅保存在内存，服务重启后清空，stdout 日志仍可由 Docker 或日志平台收集。
 
 ## 编译
 
@@ -54,19 +70,20 @@ docker compose up -d
 
 ```bash
 cp config.example.json config.json
-# 编辑 config.json 中的 server_keys、zen_keys 或 go_keys
+# 编辑 server_keys、zen_keys/go_keys，并修改 webui.password
 docker compose restart
 ```
 
 ```bash
 curl http://127.0.0.1:8080/healthz
+# 浏览器打开 http://127.0.0.1:8081
 docker compose logs -f
 ```
 
 如需修改宿主机端口：
 
 ```bash
-OPENCODE2API_PORT=18080 docker compose up -d
+OPENCODE2API_PORT=18080 OPENCODE2API_WEBUI_PORT=18081 docker compose up -d
 ```
 
 ## 配置
@@ -109,7 +126,15 @@ cp config.example.json config.json
     "failure_cooldown_seconds": 15
   },
   "logging": {
-    "level": "info"
+    "level": "info",
+    "ring_size": 2000
+  },
+  "webui": {
+    "enabled": true,
+    "listen": "0.0.0.0:8081",
+    "username": "admin",
+    "password": "change-this-admin-password",
+    "session_ttl_minutes": 720
   }
 }
 ```
@@ -223,9 +248,29 @@ socks5://127.0.0.1:1080  # 备用代理
 
 | 字段 | 含义 |
 | --- | --- |
-| `logging.level` | 日志级别，支持 `info` 和 `debug`。生产环境建议使用 `info`。 |
+| `logging.level` | 日志级别，支持 `debug`、`info`、`warn` 和 `error`，可通过 WebUI 热切换。 |
+| `logging.ring_size` | WebUI 最近日志环容量，范围 100–50000，默认 2000。stdout 不受此容量限制。 |
 
-日志不会输出完整上游 key、本地 key、Authorization、`x-api-key` 或请求消息正文。
+每条 stdout 日志都是单行 JSON，包含时间、级别、组件、事件以及适用的 request ID、模型、tier、状态码、耗时和重试次数。日志不会输出完整上游 key、本地 key、Authorization、Cookie、代理认证信息或请求消息正文。
+
+### `webui`
+
+| 字段 | 含义 |
+| --- | --- |
+| `webui.enabled` | 是否在独立端口启动管理服务。旧配置未包含该段时默认关闭。 |
+| `webui.listen` | 管理服务监听地址，示例为 `0.0.0.0:8081`。 |
+| `webui.username` | 单一管理员账号。 |
+| `webui.password` | 仅用于首次初始化的明文密码，至少 10 个字符；启动后自动删除。 |
+| `webui.password_hash` | 自动生成的 Argon2id 哈希，不应手动编辑，也不会由 WebUI API 返回。 |
+| `webui.session_ttl_minutes` | 登录 session 有效时间，范围 5–10080 分钟。 |
+
+WebUI 中普通配置响应只包含 key 尾码/指纹及脱敏 proxy。需要查看完整值时必须再次输入管理密码，敏感响应禁止浏览器缓存。
+
+### 配置保存与热重载
+
+WebUI 保存时先解析并验证完整候选配置、创建新的连接池和 Gateway，然后写入临时文件、保留 `config.json.bak` 并替换 `config.json`，最后原子切换新请求使用的运行实例。写入或初始化失败时旧实例继续工作；切换前已开始的请求不会中断。
+
+keys、proxy、上游、重试、模型、性能、优先 tier 和日志级别会立即生效。`listen`、`webui.listen` 与 `webui.enabled` 会保存但需要重启进程。WebUI 也提供“从磁盘重载”，外部编辑后的配置仍会经过相同的验证与回滚流程。保存后的 JSON 会被规范化，原有注释不会保留。
 
 
 ## 会话 ID
