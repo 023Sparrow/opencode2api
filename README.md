@@ -11,6 +11,8 @@
 - 分离配置 Zen key 池与 Zen Go key 池
 - 模型同时存在于两个上游时按 `prefer` 配置优先使用 Go 或 Zen（默认 Go）
 - 支持直连、HTTP、HTTPS、SOCKS5 和 SOCKS5H 代理
+- 支持从文本文件读取代理池，并与配置内的代理合并、去重
+- `config.json` 支持 `//` 和 `/* ... */` 注释
 - 将 key 自动均衡绑定到代理，保持连接亲和性
 - 使用稳定会话哈希保持同一会话的 key/proxy 亲和性，并在节点故障时自动回退
 - 代理失败后自动迁移绑定，key 失败后进行短时冷却
@@ -84,6 +86,7 @@ cp config.example.json config.json
   "zen_keys": ["sk-your-zen-key"],
   "go_keys": [],
   "prefer": "go",
+  "proxyfile": "",
   "proxies": ["direct"],
   "upstream": {
     "zen": "https://opencode.ai/zen",
@@ -120,6 +123,7 @@ cp config.example.json config.json
 | `zen_keys` | OpenCode Zen API key 池。允许配置多个 key。 |
 | `go_keys` | OpenCode Zen Go API key 池。没有 Go key 时可以使用空数组。 |
 | `prefer` | 模型同时存在于 Zen 与 Go 时优先使用的上游，值为 `go` 或 `zen`，默认 `go`。仅存在于某一池时不受影响。 |
+| `proxyfile` | 可选代理池文件路径。相对路径以 `config.json` 所在目录为基准；内容会追加到 `proxies` 并去重。 |
 | `proxies` | 上游代理列表。支持 `direct`、`http://`、`https://`、`socks5://` 和 `socks5h://`。URL 可以包含代理用户名和密码。 |
 
 `server_keys` 至少需要一个值；`zen_keys` 和 `go_keys` 至少有一个池不能为空。
@@ -146,6 +150,25 @@ SOCKS5 代理示例：
   "socks5://127.0.0.1:1080"
 ]
 ```
+
+也可以从文本文件加载代理池：
+
+```json
+{
+  "proxyfile": "proxies.txt",
+  "proxies": ["direct"]
+}
+```
+
+`proxies.txt` 每行填写一个代理。支持空行、以 `#`、`;` 或 `//` 开头的整行注释，也支持在代理后使用空格加这些标记写行尾注释：
+
+```text
+# HTTP 代理
+http://user:password@127.0.0.1:7890
+socks5://127.0.0.1:1080  # 备用代理
+```
+
+配置中的 `proxies` 会先加载，随后加载 `proxyfile`，重复项只保留第一次出现的位置。如果两个来源都为空，则仍使用 `direct`。`config.json` 本身支持 `//` 单行注释和 `/* ... */` 块注释；引号内的 `https://` 等内容不会被当作注释。
 
 ### `upstream`
 
