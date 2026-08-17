@@ -220,9 +220,10 @@ func (m *RuntimeManager) Shutdown() {
 }
 
 type ResourceSnapshot struct {
-	Models  modelCatalogSnapshot `json:"models"`
-	Keys    []KeyStatus          `json:"keys"`
-	Proxies []ProxyStatus        `json:"proxies"`
+	Models    modelCatalogSnapshot `json:"models"`
+	Keys      []KeyStatus          `json:"keys"`
+	Proxies   []ProxyStatus        `json:"proxies"`
+	Anonymous bool                 `json:"anonymous"`
 }
 
 type KeyStatus struct {
@@ -235,12 +236,13 @@ type KeyStatus struct {
 }
 
 type ProxyStatus struct {
-	Index    int    `json:"index"`
-	Address  string `json:"address"`
-	Healthy  bool   `json:"healthy"`
-	Checking bool   `json:"checking"`
-	ZenKeys  int    `json:"zen_keys"`
-	GoKeys   int    `json:"go_keys"`
+	Index     int    `json:"index"`
+	Address   string `json:"address"`
+	Healthy   bool   `json:"healthy"`
+	Checking  bool   `json:"checking"`
+	ZenKeys   int    `json:"zen_keys"`
+	GoKeys    int    `json:"go_keys"`
+	Anonymous bool   `json:"anonymous"`
 }
 
 func (m *RuntimeManager) Resources() ResourceSnapshot {
@@ -249,7 +251,7 @@ func (m *RuntimeManager) Resources() ResourceSnapshot {
 		return ResourceSnapshot{}
 	}
 	gateway := runtime.gateway
-	result := ResourceSnapshot{Models: gateway.catalog.Snapshot()}
+	result := ResourceSnapshot{Models: gateway.catalog.Snapshot(), Anonymous: gateway.cfg.Anonymous}
 	result.Keys = append(result.Keys, keyStatuses("zen", gateway.zenNodes)...)
 	result.Keys = append(result.Keys, keyStatuses("go", gateway.goNodes)...)
 	gateway.zenNodes.bindingsMu.Lock()
@@ -259,7 +261,7 @@ func (m *RuntimeManager) Resources() ResourceSnapshot {
 	goBindings := append([]int(nil), gateway.goNodes.bindingCount...)
 	gateway.goNodes.bindingsMu.Unlock()
 	for _, proxy := range gateway.transports.items {
-		status := ProxyStatus{Index: proxy.index, Address: redactURL(proxy.name), Healthy: proxy.healthy.Load(), Checking: proxy.checking.Load()}
+		status := ProxyStatus{Index: proxy.index, Address: redactURL(proxy.name), Healthy: proxy.healthy.Load(), Checking: proxy.checking.Load(), Anonymous: gateway.cfg.Anonymous}
 		if proxy.index < len(zenBindings) {
 			status.ZenKeys = zenBindings[proxy.index]
 		}

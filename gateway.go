@@ -17,6 +17,8 @@ import (
 
 const maxRequestBody = 32 << 20
 
+const anonymousZenKey = "public"
+
 const (
 	proxyHealthCheckURL      = "https://cloudflare.com/cdn-cgi/trace"
 	proxyHealthCheckInterval = 15 * time.Minute
@@ -29,6 +31,7 @@ type Gateway struct {
 	transports *transportPool
 	zenNodes   *nodePool
 	goNodes    *nodePool
+	anonymous  *anonymousPool
 	catalog    *modelCatalog
 	monitor    *Monitor
 }
@@ -54,9 +57,10 @@ type healthModels struct {
 }
 
 type healthKeys struct {
-	Zen   int `json:"zen"`
-	Go    int `json:"go"`
-	Total int `json:"total"`
+	Zen       int  `json:"zen"`
+	Go        int  `json:"go"`
+	Total     int  `json:"total"`
+	Anonymous bool `json:"anonymous"`
 }
 
 type healthProxies struct {
@@ -85,6 +89,7 @@ func NewGateway(cfg Config, logger *slog.Logger, monitor *Monitor) (*Gateway, er
 		transports: transports,
 		zenNodes:   zenNodes,
 		goNodes:    goNodes,
+		anonymous:  newAnonymousPool(cfg.Anonymous, transports, cooldown),
 		catalog:    newModelCatalog(cfg.Prefer, cfg.Models.Protocols),
 		monitor:    monitor,
 	}, nil
@@ -123,7 +128,7 @@ func (g *Gateway) handleHealth(w http.ResponseWriter, _ *http.Request) {
 			issues = append(issues, "model_catalog_stale")
 		}
 	}
-	if zenKeys+goKeys == 0 {
+	if zenKeys+goKeys == 0 && !g.cfg.Anonymous {
 		issues = append(issues, "no_upstream_keys")
 	}
 	if proxyHealthy == 0 {
@@ -152,7 +157,7 @@ func (g *Gateway) handleHealth(w http.ResponseWriter, _ *http.Request) {
 			LastRefresh:       lastRefresh,
 			StaleAfterSeconds: int(staleAfter / time.Second),
 		},
-		Keys: healthKeys{Zen: zenKeys, Go: goKeys, Total: zenKeys + goKeys},
+		Keys: healthKeys{Zen: zenKeys, Go: goKeys, Total: zenKeys + goKeys, Anonymous: g.cfg.Anonymous},
 		Proxies: healthProxies{
 			Total:     proxyTotal,
 			Healthy:   proxyHealthy,
@@ -226,7 +231,7 @@ func (g *Gateway) handleInference(external Protocol) http.HandlerFunc {
 			writeAPIError(w, external, http.StatusBadRequest, "the model uses an upstream protocol that opencode2api does not expose", "invalid_request_error", "model")
 			return
 		}
-		route, err := g.catalog.Route(model, len(g.cfg.ZenKeys) > 0, len(g.cfg.GoKeys) > 0)
+		route, err := g.catalog.Route(model, len(g.cfg.ZenKeys) > 0, len(g.cfg.GoKeys) > 0, g.cfg.Anonymous)
 		if err != nil {
 			writeAPIError(w, external, http.StatusBadRequest, err.Error(), "invalid_request_error", "model")
 			return
@@ -309,6 +314,83 @@ func (g *Gateway) handleInference(external Protocol) http.HandlerFunc {
 }
 
 func (g *Gateway) doUpstream(ctx context.Context, route modelRoute, body []byte, ids requestIDs) (*http.Response, error) {
+	if !route.Anonymous {
+		return g.doKeyUpstream(ctx, route, body, ids, 0)
+	}
+	resp, err, attempts, exhausted := g.doAnonymousUpstream(ctx, route, body, ids)
+	if !exhausted || g.zenNodes.Len() == 0 {
+		return resp, err
+	}
+	if resp != nil {
+		drainAndClose(resp.Body)
+	}
+	route.Anonymous = false
+	g.logger.Debug("anonymous attempts exhausted; falling back to Zen keys", "component", "upstream", "event", "anonymous_fallback", "request_id", ids.Request, "attempts", attempts)
+	return g.doKeyUpstream(ctx, route, body, ids, attempts)
+}
+
+// doAnonymousUpstream tries each selected proxy at most once. Its retry budget
+// is independent from the authenticated Zen-key phase that may follow it.
+func (g *Gateway) doAnonymousUpstream(ctx context.Context, route modelRoute, body []byte, ids requestIDs) (*http.Response, error, int, bool) {
+	var lastResponse *http.Response
+	var lastErr error
+	cursor := g.anonymous.CursorFor(ids.Session)
+	limit := min(g.cfg.Retry.MaxAttempts, g.anonymous.Len())
+	attempts := 0
+	for attempts < limit {
+		node := cursor.Next()
+		if node == nil {
+			break
+		}
+		attempts++
+		if meta, _ := ctx.Value(requestMetaKey{}).(*requestMeta); meta != nil {
+			meta.Attempts = attempts
+		}
+		if lastResponse != nil {
+			drainAndClose(lastResponse.Body)
+			lastResponse = nil
+		}
+		req, err := newUpstreamRequest(ctx, g.cfg.Upstream.Zen, route.Protocol, body, ids, anonymousZenKey)
+		if err != nil {
+			return nil, err, attempts, false
+		}
+		started := time.Now()
+		resp, err := node.proxy.client.Do(req)
+		duration := time.Since(started)
+		status := 0
+		if resp != nil {
+			status = resp.StatusCode
+		}
+		g.syncProxyResult(ctx, node.proxy, status, err)
+		if err == nil && resp.StatusCode/100 == 2 {
+			g.anonymous.MarkSuccess(node)
+			g.logger.Debug("anonymous upstream accepted request", "component", "upstream", "event", "anonymous_attempt_succeeded", "request_id", ids.Request, "attempt", attempts, "tier", TierZen, "proxy", redactURL(node.proxy.name), "status", resp.StatusCode, "duration_ms", duration.Milliseconds())
+			return resp, nil, attempts, false
+		}
+		if isNonRetryableClientResponse(resp, err) {
+			g.anonymous.MarkSuccess(node)
+			g.logger.Debug("anonymous upstream rejected a non-retryable request", "component", "upstream", "event", "anonymous_attempt_rejected", "request_id", ids.Request, "attempt", attempts, "tier", TierZen, "proxy", redactURL(node.proxy.name), "status", resp.StatusCode, "duration_ms", duration.Milliseconds())
+			return resp, nil, attempts, false
+		}
+		g.anonymous.MarkFailure(node, resp, err)
+		lastResponse = resp
+		lastErr = err
+		if err != nil {
+			g.logger.Debug("anonymous transport attempt failed", "component", "upstream", "event", "anonymous_attempt_transport_failed", "request_id", ids.Request, "attempt", attempts, "tier", TierZen, "proxy", redactURL(node.proxy.name), "duration_ms", duration.Milliseconds(), "error", err)
+		} else {
+			g.logger.Debug("anonymous upstream returned a retryable response", "component", "upstream", "event", "anonymous_attempt_retryable_response", "request_id", ids.Request, "attempt", attempts, "tier", TierZen, "proxy", redactURL(node.proxy.name), "status", resp.StatusCode, "duration_ms", duration.Milliseconds())
+		}
+	}
+	if lastResponse != nil {
+		return lastResponse, nil, attempts, true
+	}
+	if lastErr == nil {
+		lastErr = errors.New("no healthy anonymous proxies available")
+	}
+	return nil, lastErr, attempts, true
+}
+
+func (g *Gateway) doKeyUpstream(ctx context.Context, route modelRoute, body []byte, ids requestIDs, attemptOffset int) (*http.Response, error) {
 	var lastResponse *http.Response
 	var lastErr error
 	nodes := g.zenNodes
@@ -325,7 +407,7 @@ func (g *Gateway) doUpstream(ctx context.Context, route modelRoute, body []byte,
 		// Attempts are exposed only as aggregate request metadata and never
 		// include the selected credential.
 		if meta, _ := ctx.Value(requestMetaKey{}).(*requestMeta); meta != nil {
-			meta.Attempts = attempt
+			meta.Attempts = attemptOffset + attempt
 		}
 		node := cursor.Next()
 		if node == nil {
@@ -335,8 +417,7 @@ func (g *Gateway) doUpstream(ctx context.Context, route modelRoute, body []byte,
 			drainAndClose(lastResponse.Body)
 			lastResponse = nil
 		}
-		endpoint := strings.TrimRight(baseURL, "/") + protocolPath(route.Protocol)
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+		req, err := newUpstreamRequest(ctx, baseURL, route.Protocol, body, ids, node.key)
 		if err != nil {
 			return nil, err
 		}
@@ -344,19 +425,6 @@ func (g *Gateway) doUpstream(ctx context.Context, route modelRoute, body []byte,
 		if proxy == nil {
 			lastErr = errors.New("upstream key has no proxy binding")
 			break
-		}
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Accept", "application/json, text/event-stream")
-		req.Header.Set("User-Agent", opencodeUserAgent())
-		req.Header.Set("x-opencode-client", "cli")
-		req.Header.Set("x-opencode-session", ids.Session)
-		req.Header.Set("x-opencode-request", ids.Request)
-		req.Header.Set("x-opencode-project", ids.Project)
-		if route.Protocol == ProtocolAnthropic {
-			req.Header.Set("x-api-key", node.key)
-			req.Header.Set("anthropic-version", "2023-06-01")
-		} else {
-			req.Header.Set("Authorization", "Bearer "+node.key)
 		}
 		attemptStarted := time.Now()
 		resp, err := proxy.client.Do(req)
@@ -374,7 +442,7 @@ func (g *Gateway) doUpstream(ctx context.Context, route modelRoute, body []byte,
 		// Request-shape errors are deterministic and must be returned to the
 		// caller without rotating through unrelated keys. Authentication,
 		// throttling, server, and transport failures remain retryable.
-		if err == nil && resp.StatusCode >= 400 && resp.StatusCode < 500 && resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusTooManyRequests {
+		if isNonRetryableClientResponse(resp, err) {
 			nodes.MarkSuccess(node)
 			g.logger.Debug("upstream rejected a non-retryable request", "component", "upstream", "event", "attempt_rejected", "request_id", ids.Request, "attempt", attempt, "tier", route.Tier, "key_id", secretFingerprint(node.key), "status", resp.StatusCode, "proxy", redactURL(proxy.name), "duration_ms", attemptDuration.Milliseconds())
 			return resp, nil
@@ -398,6 +466,32 @@ func (g *Gateway) doUpstream(ctx context.Context, route modelRoute, body []byte,
 		return lastResponse, nil
 	}
 	return nil, lastErr
+}
+
+func newUpstreamRequest(ctx context.Context, baseURL string, protocol Protocol, body []byte, ids requestIDs, key string) (*http.Request, error) {
+	endpoint := strings.TrimRight(baseURL, "/") + protocolPath(protocol)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	req.Header.Set("User-Agent", opencodeUserAgent())
+	req.Header.Set("x-opencode-client", "cli")
+	req.Header.Set("x-opencode-session", ids.Session)
+	req.Header.Set("x-opencode-request", ids.Request)
+	req.Header.Set("x-opencode-project", ids.Project)
+	if protocol == ProtocolAnthropic {
+		req.Header.Set("x-api-key", key)
+		req.Header.Set("anthropic-version", "2023-06-01")
+	} else {
+		req.Header.Set("Authorization", "Bearer "+key)
+	}
+	return req, nil
+}
+
+func isNonRetryableClientResponse(resp *http.Response, err error) bool {
+	return err == nil && resp != nil && resp.StatusCode >= 400 && resp.StatusCode < 500 && resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusTooManyRequests
 }
 
 // syncProxyResult updates proxy health from real traffic. Only timeouts and
@@ -530,7 +624,7 @@ func (g *Gateway) StartModelRefresh(ctx context.Context) {
 		var zen, goModels []string
 		var wg sync.WaitGroup
 		wg.Add(2)
-		go func() { defer wg.Done(); zen = g.refreshTier(ctx, g.cfg.Upstream.Zen, g.zenNodes) }()
+		go func() { defer wg.Done(); zen = g.refreshZen(ctx) }()
 		go func() { defer wg.Done(); goModels = g.refreshTier(ctx, g.cfg.Upstream.Go, g.goNodes) }()
 		wg.Wait()
 		if zen != nil || goModels != nil {
@@ -551,6 +645,39 @@ func (g *Gateway) StartModelRefresh(ctx context.Context) {
 			}
 		}
 	}()
+}
+
+func (g *Gateway) refreshZen(ctx context.Context) []string {
+	if models := g.refreshTier(ctx, g.cfg.Upstream.Zen, g.zenNodes); models != nil {
+		return models
+	}
+	if !g.cfg.Anonymous {
+		return nil
+	}
+	return g.refreshAnonymousTier(ctx, g.cfg.Upstream.Zen)
+}
+
+func (g *Gateway) refreshAnonymousTier(ctx context.Context, base string) []string {
+	cursor := g.anonymous.CursorFor("")
+	limit := min(g.cfg.Retry.MaxAttempts, g.anonymous.Len())
+	for attempt := 1; attempt <= limit; attempt++ {
+		node := cursor.Next()
+		if node == nil {
+			break
+		}
+		refreshCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		models, status, err := fetchModels(refreshCtx, node.proxy.client, base, anonymousZenKey)
+		g.syncProxyResult(refreshCtx, node.proxy, status, err)
+		cancel()
+		if err == nil {
+			g.anonymous.MarkSuccess(node)
+			return models
+		}
+		g.anonymous.MarkFailure(node, nil, err)
+		g.logger.Debug("anonymous model catalog refresh attempt failed", "component", "models", "event", "anonymous_refresh_attempt_failed", "upstream", redactURL(base), "attempt", attempt, "proxy", redactURL(node.proxy.name), "error", err)
+	}
+	g.logger.Warn("anonymous model catalog refresh failed", "component", "models", "event", "anonymous_refresh_failed", "upstream", redactURL(base))
+	return nil
 }
 
 func (g *Gateway) refreshTier(ctx context.Context, base string, nodes *nodePool) []string {

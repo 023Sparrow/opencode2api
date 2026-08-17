@@ -30,6 +30,102 @@ type transportPool struct {
 	items []*proxyTransport
 }
 
+// anonymousPool gives the shared OpenCode "public" credential an independent
+// cooldown per proxy. Unlike key nodes, anonymous nodes are never rebound:
+// changing proxy is the failover mechanism because Zen rate-limits them by IP.
+type anonymousPool struct {
+	nodes    []*anonymousNode
+	next     atomic.Uint64
+	cooldown time.Duration
+}
+
+type anonymousNode struct {
+	proxy         *proxyTransport
+	failures      atomic.Uint32
+	cooldownUntil atomic.Int64
+}
+
+type anonymousCursor struct {
+	pool   *anonymousPool
+	start  int
+	offset int
+}
+
+func newAnonymousPool(enabled bool, transports *transportPool, cooldown time.Duration) *anonymousPool {
+	pool := &anonymousPool{cooldown: cooldown}
+	if !enabled || transports == nil {
+		return pool
+	}
+	pool.nodes = make([]*anonymousNode, 0, len(transports.items))
+	for _, proxy := range transports.items {
+		pool.nodes = append(pool.nodes, &anonymousNode{proxy: proxy})
+	}
+	return pool
+}
+
+func (p *anonymousPool) Len() int {
+	if p == nil {
+		return 0
+	}
+	return len(p.nodes)
+}
+
+func (p *anonymousPool) CursorFor(affinity string) anonymousCursor {
+	if p == nil || len(p.nodes) == 0 {
+		return anonymousCursor{pool: p}
+	}
+	start := 0
+	if affinity == "" {
+		start = int((p.next.Add(1) - 1) % uint64(len(p.nodes)))
+	} else {
+		hash := fnv.New64a()
+		_, _ = hash.Write([]byte(affinity))
+		start = int(hash.Sum64() % uint64(len(p.nodes)))
+	}
+	return anonymousCursor{pool: p, start: start}
+}
+
+// Next visits each healthy, non-cooling proxy at most once per cursor.
+func (c *anonymousCursor) Next() *anonymousNode {
+	if c.pool == nil || len(c.pool.nodes) == 0 {
+		return nil
+	}
+	now := time.Now().UnixNano()
+	for c.offset < len(c.pool.nodes) {
+		node := c.pool.nodes[(c.start+c.offset)%len(c.pool.nodes)]
+		c.offset++
+		if node.proxy.healthy.Load() && node.cooldownUntil.Load() <= now {
+			return node
+		}
+	}
+	return nil
+}
+
+func (p *anonymousPool) MarkSuccess(node *anonymousNode) {
+	if node == nil {
+		return
+	}
+	node.failures.Store(0)
+	node.cooldownUntil.Store(0)
+}
+
+func (p *anonymousPool) MarkFailure(node *anonymousNode, resp *http.Response, err error) {
+	if node == nil {
+		return
+	}
+	if err == nil && resp != nil && resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode < 500 {
+		return
+	}
+	failures := node.failures.Add(1)
+	delay := p.cooldown * time.Duration(1<<min(failures-1, 3))
+	if resp != nil {
+		if retryAfter := parseRetryAfter(resp.Header.Get("Retry-After")); retryAfter > delay {
+			delay = retryAfter
+		}
+	}
+	node.cooldownUntil.Store(time.Now().Add(delay).UnixNano())
+}
+
 func (p *transportPool) hasHealthy() bool {
 	for _, proxy := range p.items {
 		if proxy.healthy.Load() {

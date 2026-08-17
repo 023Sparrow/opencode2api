@@ -19,6 +19,7 @@ type Config struct {
 	ServerKeys  []string          `json:"server_keys"`
 	ZenKeys     []string          `json:"zen_keys"`
 	GoKeys      []string          `json:"go_keys"`
+	Anonymous   bool              `json:"anonymous"`
 	Proxies     []string          `json:"proxies"`
 	ProxyFile   string            `json:"proxyfile"`
 	Upstream    UpstreamConfig    `json:"upstream"`
@@ -119,8 +120,8 @@ func NormalizeConfig(path string, cfg Config) (Config, error) {
 	if len(cfg.ServerKeys) == 0 {
 		return Config{}, errors.New("server_keys must contain at least one local key")
 	}
-	if len(cfg.ZenKeys) == 0 && len(cfg.GoKeys) == 0 {
-		return Config{}, errors.New("zen_keys or go_keys must contain at least one upstream key")
+	if !cfg.Anonymous && len(cfg.ZenKeys) == 0 && len(cfg.GoKeys) == 0 {
+		return Config{}, errors.New("zen_keys or go_keys must contain at least one upstream key unless anonymous is enabled")
 	}
 	if cfg.Retry.MaxAttempts < 1 {
 		return Config{}, errors.New("retry.max_attempts must be at least 1")

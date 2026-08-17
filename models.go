@@ -33,9 +33,10 @@ const (
 )
 
 type modelRoute struct {
-	ID       string
-	Tier     Tier
-	Protocol Protocol
+	ID        string
+	Tier      Tier
+	Protocol  Protocol
+	Anonymous bool
 }
 
 type modelCatalog struct {
@@ -95,12 +96,17 @@ func (c *modelCatalog) CopyState(source *modelCatalog) {
 	c.mu.Unlock()
 }
 
-func (c *modelCatalog) Route(model string, hasZenKeys, hasGoKeys bool) (modelRoute, error) {
+func (c *modelCatalog) Route(model string, hasZenKeys, hasGoKeys, hasAnonymous bool) (modelRoute, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	protocol := c.protocols[model]
 	if protocol == "" {
 		protocol = inferProtocol(model)
+	}
+	// OpenCode's public credential is a Zen-only lane. Prefer it for free
+	// models that are known to Zen, or while the initial catalog is pending.
+	if hasAnonymous && isFreeModel(model) && (c.zen[model] || len(c.zen) == 0 && len(c.goModels) == 0) {
+		return modelRoute{ID: model, Tier: TierZen, Protocol: protocol, Anonymous: true}, nil
 	}
 	// When a model exists on both tiers, honor the configured priority.
 	preferGo := c.prefer == TierGo
@@ -126,6 +132,10 @@ func (c *modelCatalog) Route(model string, hasZenKeys, hasGoKeys bool) (modelRou
 		}
 	}
 	return modelRoute{}, fmt.Errorf("model %q is not available in the configured Zen or Go pools", model)
+}
+
+func isFreeModel(model string) bool {
+	return strings.Contains(strings.ToLower(model), "free")
 }
 
 func (c *modelCatalog) List() []string {

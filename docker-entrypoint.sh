@@ -19,7 +19,7 @@ else
         cp "$app_dir/config.example.json" "$generated_config"
     fi
     active_config=$generated_config
-    printf '%s\n' "config.json not found; using a persistent generated copy. Set real API keys and change the WebUI password before use."
+    printf '%s\n' "config.json not found; using a persistent generated copy. Set real API keys or enable anonymous mode, and change the WebUI password before use."
 fi
 
 source_fingerprint() {

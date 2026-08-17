@@ -9,6 +9,7 @@
 - 支持普通响应和 SSE 流式响应
 - 支持文本、图片、thinking/reasoning、工具定义、工具调用和工具结果转换
 - 分离配置 Zen key 池与 Zen Go key 池
+- 支持无需上游 key 的 Zen 匿名模式，免费模型优先按代理出口 IP 轮换并可回退 Zen key
 - 模型同时存在于两个上游时按 `prefer` 配置优先使用 Go 或 Zen（默认 Go）
 - 支持直连、HTTP、HTTPS、SOCKS5 和 SOCKS5H 代理
 - 支持从文本文件读取代理池，并与配置内的代理合并、去重
@@ -33,7 +34,7 @@
 | `POST` | `/v1/messages` | Anthropic Messages |
 | `GET` | `/healthz` | 健康检查 |
 
-`/healthz` 无需 API key，返回服务版本以及模型目录、Zen/Go key 和代理池的汇总状态，不会暴露 key 或代理地址。模型目录尚未完成首次刷新、已经过期、没有可暴露模型或没有健康代理时返回 HTTP `503`；其余情况返回 `200`。
+`/healthz` 无需 API key，返回服务版本以及模型目录、Zen/Go key、匿名开关和代理池的汇总状态，不会暴露 key 或代理地址。模型目录尚未完成首次刷新、已经过期、没有可暴露模型或没有健康代理时返回 HTTP `503`；其余情况返回 `200`。
 
 模型目录的过期阈值为 `models.refresh_seconds` 的两倍，且不低于 60 秒。刚启动时短暂返回 `503 starting` 属于正常现象，模型列表首次刷新成功后会变为 `200 ok`。
 
@@ -102,6 +103,7 @@ cp config.example.json config.json
   "server_keys": ["change-this-local-key"],
   "zen_keys": ["sk-your-zen-key"],
   "go_keys": [],
+  "anonymous": false,
   "prefer": "go",
   "proxyfile": "",
   "proxies": ["direct"],
@@ -147,11 +149,20 @@ cp config.example.json config.json
 | `server_keys` | 调用本代理时使用的本地 API key 列表。它们只用于本地鉴权，不会发送给 OpenCode。 |
 | `zen_keys` | OpenCode Zen API key 池。允许配置多个 key。 |
 | `go_keys` | OpenCode Zen Go API key 池。没有 Go key 时可以使用空数组。 |
+| `anonymous` | 是否启用 Zen 匿名模式，默认 `false`。启用后模型 ID 包含 `free` 时优先使用 OpenCode 的 `public` 凭证。 |
 | `prefer` | 模型同时存在于 Zen 与 Go 时优先使用的上游，值为 `go` 或 `zen`，默认 `go`。仅存在于某一池时不受影响。 |
 | `proxyfile` | 可选代理池文件路径。相对路径以 `config.json` 所在目录为基准；内容会追加到 `proxies` 并去重。 |
 | `proxies` | 上游代理列表。支持 `direct`、`http://`、`https://`、`socks5://` 和 `socks5h://`。URL 可以包含代理用户名和密码。 |
 
-`server_keys` 至少需要一个值；`zen_keys` 和 `go_keys` 至少有一个池不能为空。
+`server_keys` 至少需要一个值。`anonymous` 为 `false` 时，`zen_keys` 和 `go_keys` 至少有一个池不能为空；启用匿名模式后两个上游 key 池可以同时为空。
+
+### Zen 匿名模式
+
+OpenCode 客户端在没有配置 Zen key 时使用固定的 `public` 凭证；Zen 服务端将它转换为匿名请求，并按出口 IP 对允许匿名访问的模型限流。本项目使用相同协议：OpenAI/Responses 上游请求发送 `Authorization: Bearer public`，Anthropic 上游请求发送 `x-api-key: public`。
+
+启用 `anonymous` 后，模型 ID 大小写不敏感地包含 `free` 时优先走匿名 Zen。遇到网络错误、401、403、429 或 5xx 会切换到下一个健康 proxy；429 的 `Retry-After` 只冷却对应 proxy 的匿名通道。匿名阶段最多尝试 `retry.max_attempts` 个不同 proxy，全部失败后若存在真实 `zen_keys`，再以独立的重试预算回退 Zen key 池。其他 4xx 属于确定性的请求错误，不切换 proxy 或 key。
+
+`/v1/models` 保持现有模型目录行为，不会因为启用匿名模式而只保留免费模型。匿名模式本身只能为名称包含 `free` 的 Zen 模型建立无 key 路由；其他模型仍需要真实 Zen/Go key。
 
 ### key 与代理分配规则
 
@@ -206,7 +217,7 @@ socks5://127.0.0.1:1080  # 备用代理
 
 | 字段 | 含义 |
 | --- | --- |
-| `retry.max_attempts` | 单个请求的最大尝试次数，包含第一次请求。网络错误、认证失败、限流和 5xx 会切换节点；其他 4xx 属于确定性的请求错误，会直接返回而不轮换 key。 |
+| `retry.max_attempts` | 每个请求阶段的最大尝试次数，包含第一次请求。网络错误、认证失败、限流和 5xx 会切换节点；其他 4xx 属于确定性的请求错误，会直接返回而不轮换 key。匿名阶段和随后的 Zen key 回退阶段各自使用该预算。 |
 | `retry.timeout_seconds` | 单个客户端请求的总超时时间，同时用于限制上游响应头等待时间。 |
 
 流式响应一旦已经向客户端输出数据，就不会切换节点重新生成，避免拼接两个不同的响应。
