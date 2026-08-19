@@ -46,6 +46,7 @@ type modelCatalog struct {
 	protocols map[string]Protocol
 	updatedAt time.Time
 	prefer    Tier
+	metadata  *modelMetadataStore
 }
 
 type modelCatalogSnapshot struct {
@@ -105,7 +106,8 @@ func (c *modelCatalog) Route(model string, hasZenKeys, hasGoKeys, hasAnonymous b
 	}
 	// OpenCode's public credential is a Zen-only lane. Prefer it for free
 	// models that are known to Zen, or while the initial catalog is pending.
-	if hasAnonymous && isFreeModel(model) && (c.zen[model] || len(c.zen) == 0 && len(c.goModels) == 0) {
+	decision := c.anonymousDecision(model)
+	if hasAnonymous && decision.Allowed && (c.zen[model] || len(c.zen) == 0 && len(c.goModels) == 0) {
 		return modelRoute{ID: model, Tier: TierZen, Protocol: protocol, Anonymous: true}, nil
 	}
 	// When a model exists on both tiers, honor the configured priority.
@@ -132,6 +134,13 @@ func (c *modelCatalog) Route(model string, hasZenKeys, hasGoKeys, hasAnonymous b
 		}
 	}
 	return modelRoute{}, fmt.Errorf("model %q is not available in the configured Zen or Go pools", model)
+}
+
+func (c *modelCatalog) anonymousDecision(model string) AnonymousDecision {
+	if c.metadata != nil {
+		return c.metadata.Decide(model)
+	}
+	return AnonymousDecision{Allowed: isFreeModel(model), Source: "name_fallback_metadata_pending"}
 }
 
 func isFreeModel(model string) bool {

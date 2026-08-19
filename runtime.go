@@ -37,6 +37,7 @@ type RuntimeManager struct {
 	current    atomic.Pointer[gatewayRuntime]
 	updateMu   sync.Mutex
 	effective  effectiveListeners
+	metadata   *modelMetadataStore
 }
 
 type effectiveListeners struct {
@@ -50,6 +51,7 @@ func NewRuntimeManager(root context.Context, configPath string, cfg Config, logg
 		configPath: configPath, root: root, logger: logger, monitor: monitor, hub: hub, redactor: redactor, level: level,
 		effective: effectiveListeners{API: cfg.Listen, WebUI: cfg.WebUI.Listen, WebUIEnabled: cfg.WebUI.Enabled},
 	}
+	manager.metadata = newModelMetadataStore(configPath, logger)
 	if cfg.WebUI.Password != "" {
 		hash, err := hashPassword(cfg.WebUI.Password)
 		if err != nil {
@@ -72,6 +74,7 @@ func NewRuntimeManager(root context.Context, configPath string, cfg Config, logg
 	manager.redactor.Replace(cfg)
 	setLogLevel(manager.level, cfg.Logging.Level)
 	manager.start(runtime)
+	manager.metadata.Start(root)
 	return manager, nil
 }
 
@@ -80,6 +83,7 @@ func (m *RuntimeManager) build(cfg Config) (*gatewayRuntime, error) {
 	if err != nil {
 		return nil, err
 	}
+	gateway.catalog.metadata = m.metadata
 	return &gatewayRuntime{config: cfg, gateway: gateway, handler: gateway.Handler(), cancel: func() {}}, nil
 }
 
@@ -224,6 +228,7 @@ type ResourceSnapshot struct {
 	Keys      []KeyStatus          `json:"keys"`
 	Proxies   []ProxyStatus        `json:"proxies"`
 	Anonymous bool                 `json:"anonymous"`
+	Metadata  MetadataSnapshot     `json:"metadata"`
 }
 
 type KeyStatus struct {
@@ -252,6 +257,9 @@ func (m *RuntimeManager) Resources() ResourceSnapshot {
 	}
 	gateway := runtime.gateway
 	result := ResourceSnapshot{Models: gateway.catalog.Snapshot(), Anonymous: gateway.cfg.Anonymous}
+	if gateway.catalog.metadata != nil {
+		result.Metadata = gateway.catalog.metadata.Snapshot()
+	}
 	result.Keys = append(result.Keys, keyStatuses("zen", gateway.zenNodes)...)
 	result.Keys = append(result.Keys, keyStatuses("go", gateway.goNodes)...)
 	gateway.zenNodes.bindingsMu.Lock()

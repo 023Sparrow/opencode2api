@@ -201,6 +201,9 @@ func (g *Gateway) handleModels(w http.ResponseWriter, _ *http.Request) {
 		if !supportedModel(model) {
 			continue
 		}
+		if g.cfg.Anonymous && len(g.cfg.ZenKeys) == 0 && len(g.cfg.GoKeys) == 0 && !g.catalog.anonymousDecision(model).Allowed {
+			continue
+		}
 		data = append(data, map[string]any{"id": model, "object": "model", "created": now, "owned_by": "opencode"})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
