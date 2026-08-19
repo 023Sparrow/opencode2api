@@ -37,6 +37,10 @@ type modelRoute struct {
 	Tier      Tier
 	Protocol  Protocol
 	Anonymous bool
+	// KeyTiers is the ordered authenticated fallback plan. Anonymous requests
+	// always start on Zen, then enter this list when the public credential does
+	// not succeed.
+	KeyTiers []Tier
 }
 
 type ModelRouteDiagnostic struct {
@@ -48,6 +52,7 @@ type ModelRouteDiagnostic struct {
 	AvailableGo          bool              `json:"available_go"`
 	Tier                 Tier              `json:"tier,omitempty"`
 	Anonymous            bool              `json:"anonymous"`
+	KeyTiers             []Tier            `json:"key_tiers,omitempty"`
 	AnonymousEligibility AnonymousDecision `json:"anonymous_eligibility"`
 	RouteError           string            `json:"route_error,omitempty"`
 }
@@ -117,36 +122,47 @@ func (c *modelCatalog) Route(model string, hasZenKeys, hasGoKeys, hasAnonymous b
 	if protocol == "" {
 		protocol = inferProtocol(model)
 	}
-	// OpenCode's public credential is a Zen-only lane. Prefer it for free
-	// models that are known to Zen, or while the initial catalog is pending.
+	keyTiers := c.keyTierOrderLocked(model, hasZenKeys, hasGoKeys)
+	// OpenCode's public credential is a Zen-only lane. Every free model starts
+	// there, even if the current catalog only advertises it on Go: an upstream
+	// rejection will move the request into the authenticated fallback plan.
 	decision := c.anonymousDecision(model)
-	if hasAnonymous && decision.Allowed && (c.zen[model] || len(c.zen) == 0 && len(c.goModels) == 0) {
-		return modelRoute{ID: model, Tier: TierZen, Protocol: protocol, Anonymous: true}, nil
+	if hasAnonymous && decision.Allowed {
+		return modelRoute{ID: model, Tier: TierZen, Protocol: protocol, Anonymous: true, KeyTiers: keyTiers}, nil
 	}
-	// When a model exists on both tiers, honor the configured priority.
-	preferGo := c.prefer == TierGo
-	if preferGo && c.goModels[model] && hasGoKeys {
-		return modelRoute{ID: model, Tier: TierGo, Protocol: protocol}, nil
-	}
-	if c.zen[model] && hasZenKeys {
-		return modelRoute{ID: model, Tier: TierZen, Protocol: protocol}, nil
-	}
-	if !preferGo && c.goModels[model] && hasGoKeys {
-		return modelRoute{ID: model, Tier: TierGo, Protocol: protocol}, nil
-	}
-	// Model discovery can temporarily fail. Honor the configured priority.
-	if len(c.zen) == 0 && len(c.goModels) == 0 {
-		if preferGo && hasGoKeys {
-			return modelRoute{ID: model, Tier: TierGo, Protocol: protocol}, nil
-		}
-		if hasZenKeys {
-			return modelRoute{ID: model, Tier: TierZen, Protocol: protocol}, nil
-		}
-		if hasGoKeys {
-			return modelRoute{ID: model, Tier: TierGo, Protocol: protocol}, nil
-		}
+	if len(keyTiers) > 0 {
+		return modelRoute{ID: model, Tier: keyTiers[0], Protocol: protocol, KeyTiers: keyTiers}, nil
 	}
 	return modelRoute{}, fmt.Errorf("model %q is not available in the configured Zen or Go pools", model)
+}
+
+// keyTierOrderLocked builds an authenticated route in prefer order. A tier is
+// included only when it has a key and advertises the model. Before the first
+// successful catalog refresh, configured key pools remain usable so temporary
+// discovery failures do not take the gateway offline.
+func (c *modelCatalog) keyTierOrderLocked(model string, hasZenKeys, hasGoKeys bool) []Tier {
+	catalogPending := len(c.zen) == 0 && len(c.goModels) == 0
+	available := func(tier Tier) bool {
+		switch tier {
+		case TierZen:
+			return hasZenKeys && (catalogPending || c.zen[model])
+		case TierGo:
+			return hasGoKeys && (catalogPending || c.goModels[model])
+		default:
+			return false
+		}
+	}
+	order := []Tier{TierZen, TierGo}
+	if c.prefer == TierGo {
+		order[0], order[1] = order[1], order[0]
+	}
+	result := make([]Tier, 0, len(order))
+	for _, tier := range order {
+		if available(tier) {
+			result = append(result, tier)
+		}
+	}
+	return result
 }
 
 func (c *modelCatalog) anonymousDecision(model string) AnonymousDecision {
@@ -176,6 +192,7 @@ func (c *modelCatalog) Diagnostic(model string, requested Protocol, hasZenKeys, 
 		return diagnostic
 	}
 	diagnostic.Tier, diagnostic.Anonymous = route.Tier, route.Anonymous
+	diagnostic.KeyTiers = append([]Tier(nil), route.KeyTiers...)
 	return diagnostic
 }
 

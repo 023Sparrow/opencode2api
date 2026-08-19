@@ -158,17 +158,34 @@ func (store *modelMetadataStore) Decide(model string) AnonymousDecision {
 	price, exists := store.models[model]
 	ready := !store.updatedAt.IsZero() && len(store.models) > 0
 	store.mu.RUnlock()
+	nameFree := isFreeModel(model)
 	fallback := func(source string) AnonymousDecision {
-		return AnonymousDecision{Allowed: isFreeModel(model), Source: source, Known: false}
+		if nameFree {
+			return AnonymousDecision{Allowed: true, Source: "name_free", Known: false}
+		}
+		return AnonymousDecision{Allowed: false, Source: source, Known: false}
 	}
 	if !ready {
-		return fallback("name_fallback_metadata_pending")
+		return fallback("metadata_pending")
 	}
 	if !exists {
-		return fallback("name_fallback_model_missing")
+		return fallback("metadata_model_missing")
 	}
 	decision := AnonymousDecision{
 		Known: true, Deprecated: price.Deprecated, InputCost: price.Input, OutputCost: price.Output,
+	}
+	metadataFree := !price.Deprecated && price.Input != nil && price.Output != nil && *price.Input == 0 && *price.Output == 0
+	if nameFree || metadataFree {
+		decision.Allowed = true
+		switch {
+		case nameFree && metadataFree:
+			decision.Source = "name_and_metadata_free"
+		case nameFree:
+			decision.Source = "name_free"
+		default:
+			decision.Source = "metadata_free"
+		}
+		return decision
 	}
 	if price.Deprecated {
 		decision.Source = "metadata_deprecated"
@@ -176,13 +193,7 @@ func (store *modelMetadataStore) Decide(model string) AnonymousDecision {
 	}
 	if price.Input == nil || price.Output == nil {
 		decision.Known = false
-		decision.Allowed = isFreeModel(model)
-		decision.Source = "name_fallback_cost_unknown"
-		return decision
-	}
-	if *price.Input == 0 && *price.Output == 0 {
-		decision.Allowed = true
-		decision.Source = "metadata_free"
+		decision.Source = "metadata_cost_unknown"
 		return decision
 	}
 	decision.Source = "metadata_paid"

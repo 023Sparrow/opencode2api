@@ -9,9 +9,9 @@
 - 支持普通响应和 SSE 流式响应
 - 支持文本、图片、thinking/reasoning、工具定义、工具调用和工具结果转换
 - 分离配置 Zen key 池与 Zen Go key 池
-- 支持无需上游 key 的 Zen 匿名模式，兼容型免费模型可按代理节点轮换并回退 Zen key
-- 每 24 小时从 models.dev 更新 OpenCode 成本与弃用信息，以兼容规则判断匿名资格
-- 模型同时存在于两个上游时按 `prefer` 配置优先使用 Go 或 Zen（默认 Go）
+- 支持无需上游 key 的 Zen 匿名模式，免费模型先走匿名通道，失败后按 `prefer` 顺序回退 Zen/Go key
+- 每 24 小时从 models.dev 更新 OpenCode 成本与弃用信息；models.dev 零成本或名称含 `free` 任一条件即可判定免费
+- 模型同时存在于两个上游时按 `prefer` 配置排列 Go/Zen key 的首选与回退顺序（默认 Go）
 - 支持直连、HTTP、HTTPS、SOCKS5 和 SOCKS5H 代理
 - 支持从文本文件读取代理池，并与配置内的代理合并、去重
 - `config.json` 支持 `//` 和 `/* ... */` 注释
@@ -203,8 +203,8 @@ cp config.example.json config.json
 | `server_keys` | 调用本代理时使用的本地 API key 列表。它们只用于本地鉴权，不会发送给 OpenCode。 |
 | `zen_keys` | OpenCode Zen API key 池。允许配置多个 key。 |
 | `go_keys` | OpenCode Zen Go API key 池。没有 Go key 时可以使用空数组。 |
-| `anonymous` | 是否启用 Zen 匿名模式，默认 `false`。匿名资格由 models.dev 已知资料优先、名称规则回退的兼容逻辑决定。 |
-| `prefer` | 模型同时存在于 Zen 与 Go 时优先使用的上游，值为 `go` 或 `zen`，默认 `go`。仅存在于某一池时不受影响。 |
+| `anonymous` | 是否启用 Zen 匿名模式，默认 `false`。models.dev 判定为零成本，或模型名称包含 `free`，任一条件成立即可进入匿名通道。 |
+| `prefer` | 模型同时存在于 Zen 与 Go 时认证 Key 的尝试顺序，值为 `go` 或 `zen`，默认 `go`。首选 Tier 失败后回退另一 Tier；仅存在于某一池时只尝试该池。 |
 | `proxyfile` | 可选代理池文件路径。相对路径以 `config.json` 所在目录为基准；内容会追加到 `proxies` 并去重。 |
 | `proxies` | 上游代理列表。支持 `direct`、`http://`、`https://`、`socks5://` 和 `socks5h://`。URL 可以包含代理用户名和密码。 |
 
@@ -214,13 +214,12 @@ cp config.example.json config.json
 
 OpenCode 客户端在没有配置 Zen key 时使用固定的 `public` 凭证；Zen 服务端将它转换为匿名请求，并按出口 IP 对允许匿名访问的模型限流。本项目使用相同协议：OpenAI/Responses 上游请求发送 `Authorization: Bearer public`，Anthropic 上游请求发送 `x-api-key: public`。
 
-启用 `anonymous` 后，匿名资格按以下顺序判断：
+启用 `anonymous` 后，以下任一条件成立即视为免费模型：
 
-1. models.dev 已知输入、输出成本都为 `0`，且模型未弃用：允许匿名，不要求名称含 `free`。
-2. models.dev 已知为付费或已弃用：拒绝匿名，即使模型名称含 `free`。
-3. metadata 尚未就绪、模型缺失，或输入/输出任一成本未知：回退现有名称规则，模型 ID 大小写不敏感地包含 `free` 时允许匿名。
+1. models.dev 已知输入、输出成本都为 `0`，且模型未弃用；不要求名称包含 `free`。
+2. 模型 ID 大小写不敏感地包含 `free`；即使 metadata 尚未就绪、缺少该模型或显示为付费，也仍按名称条件视为免费。
 
-符合资格的模型优先走匿名 Zen。遇到网络错误、401、403、429 或 5xx 会切换到下一个健康 proxy 节点；429 的 `Retry-After` 只冷却对应节点的匿名通道。匿名阶段最多尝试 `retry.max_attempts` 个不同节点，全部失败后若存在真实 `zen_keys`，再以独立的重试预算回退 Zen key 池。其他 4xx 属于确定性的请求错误，不切换 proxy 或 key。监控中的 `proxy_node` 表示所选代理节点，不代表或推断实际出口 IP。
+免费模型先走匿名 Zen，非免费模型完全跳过匿名通道。匿名请求遇到任何错误——包括传输错误、4xx、5xx 或其他非 2xx 响应——都会继续切换下一个当前可用的 proxy；每个可用 proxy 最多尝试一次。anonymous 阶段不受 `retry.max_attempts` 提前截断，只有可用 proxy 全部耗尽后才进入认证 Key 阶段。认证 Tier 按 `prefer` 排序：`prefer: "go"` 为 Go key → Zen key，`prefer: "zen"` 为 Zen key → Go key；首选 Tier 仍不成功时才尝试另一个实际提供该模型且配置了 Key 的 Tier。Zen/Go Key 阶段各自拥有 `retry.max_attempts` 预算。监控中的 `proxy_node` 表示所选代理节点，不代表或推断实际出口 IP。
 
 只有匿名通道、且 `zen_keys` 与 `go_keys` 都为空时，`/v1/models` 只展示按上述规则可匿名使用的模型。只要配置了任一真实上游 Key，模型列表仍展示该 Key 路由可用的完整模型集合。
 
@@ -279,7 +278,7 @@ socks5://127.0.0.1:1080  # 备用代理
 
 | 字段 | 含义 |
 | --- | --- |
-| `retry.max_attempts` | 每个请求阶段的最大尝试次数，包含第一次请求。网络错误、认证失败、限流和 5xx 会切换节点；其他 4xx 属于确定性的请求错误，会直接返回而不轮换 key。匿名阶段和随后的 Zen key 回退阶段各自使用该预算。 |
+| `retry.max_attempts` | 每个认证 Key Tier 的最大尝试次数，包含第一次请求。Tier 内部遇到网络错误、认证失败、限流或 5xx 会切换节点；其他 4xx 会结束当前 Tier。只要还有另一个可用 Tier，当前 Tier 的最终失败会继续按 `prefer` 顺序回退。anonymous 不使用此上限，而是将每个当前可用 proxy 各尝试一次。 |
 | `retry.timeout_seconds` | 单个客户端请求的总超时时间，同时用于限制上游响应头等待时间。 |
 
 流式响应一旦已经向客户端输出数据，就不会切换节点重新生成，避免拼接两个不同的响应。
@@ -300,7 +299,7 @@ socks5://127.0.0.1:1080  # 备用代理
 }
 ```
 
-模型同时存在于 Zen 与 Go 时按 `prefer` 配置选择：值为 `go` 时优先 Go，值为 `zen` 时优先 Zen（默认 `go`）。仅存在于某一池时才使用该池的 key。
+模型同时存在于 Zen 与 Go 时按 `prefer` 配置排列认证 Key 顺序：值为 `go` 时先 Go 后 Zen，值为 `zen` 时先 Zen 后 Go（默认 `go`）。首选 Tier 失败后才回退另一 Tier；仅存在于某一池时只使用该池的 key。免费模型在这条认证顺序之前额外尝试匿名 Zen。
 
 `deepseek-v4-flash-free` 默认使用 Chat 原生协议。与所有模型一样，`models.protocols` 中的显式映射优先于该默认值和名称推断。
 
