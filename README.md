@@ -112,22 +112,28 @@ go build -o opencode2api ./
 
 预编译的 Windows、Linux 和 macOS 可执行文件可从 [GitHub Releases](https://github.com/jasonxu114514/opencode2api/releases) 下载。
 
-## Docker Compose 部署
+## GHCR / Docker Compose 部署
 
-服务器安装 Docker 与 Docker Compose 后，可以在克隆项目后直接启动：
+正式镜像发布在 `ghcr.io/jasonxu114514/opencode2api`
+
 
 ```bash
 git clone https://github.com/jasonxu114514/opencode2api.git
 cd opencode2api
+cp config.example.json config.json
+# 编辑 server_keys、zen_keys/go_keys，并修改 webui.password
+docker compose pull
 docker compose up -d
 ```
 
+首次启动会把 `config.json` 导入 `opencode2api-state` 命名卷。之后应通过 WebUI 修改配置；如需再次从宿主机导入配置，可执行：
 
 ```bash
-cp config.example.json config.json
-# 编辑 server_keys、zen_keys/go_keys，并修改 webui.password
+docker compose cp config.json opencode2api:/var/lib/opencode2api/config.json
 docker compose restart
 ```
+
+健康检查、WebUI 和日志：
 
 ```bash
 curl http://127.0.0.1:8080/healthz
@@ -135,10 +141,22 @@ curl http://127.0.0.1:8080/healthz
 docker compose logs -f
 ```
 
-如需修改宿主机端口：
+可通过环境变量固定镜像版本和修改宿主机端口：
 
 ```bash
-OPENCODE2API_PORT=18080 OPENCODE2API_WEBUI_PORT=18081 docker compose up -d
+OPENCODE2API_VERSION=v1.2.3 OPENCODE2API_PORT=18080 OPENCODE2API_WEBUI_PORT=18081 docker compose up -d
+```
+
+不使用 Compose 时也可直接运行 GHCR 镜像：
+
+```bash
+docker volume create opencode2api-state
+docker run -d --name opencode2api --restart unless-stopped \
+  -p 8080:8080 -p 8081:8081 \
+  -e CONFIG_SEED_PATH=/run/config/opencode2api.json \
+  -v "$(pwd)/config.json:/run/config/opencode2api.json:ro" \
+  -v opencode2api-state:/var/lib/opencode2api \
+  ghcr.io/jasonxu114514/opencode2api:latest
 ```
 
 ## 配置
