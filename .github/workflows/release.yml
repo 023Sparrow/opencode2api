@@ -139,8 +139,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ steps.metadata.outputs.release_tag }}
         run: |
-          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release upload "$RELEASE_TAG" release-files/* --clobber
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" release-files/* --clobber --repo "$GITHUB_REPOSITORY"
           else
-            gh release create "$RELEASE_TAG" release-files/* --generate-notes --title "$RELEASE_TAG" --target "$GITHUB_SHA"
+            gh release create "$RELEASE_TAG" release-files/* --generate-notes --title "$RELEASE_TAG" --target "$GITHUB_SHA" --repo "$GITHUB_REPOSITORY"
           fi
