@@ -58,6 +58,10 @@ WebUI 可查看最近一小时的请求率、成功率、状态码与延迟分�
 go build -o opencode2api ./
 ```
 
+## 下载
+
+预编译的 Windows、Linux 和 macOS 可执行文件可从 [GitHub Releases](https://github.com/jasonxu114514/opencode2api/releases) 下载。
+
 ## Docker Compose 部署
 
 服务器安装 Docker 与 Docker Compose 后，可以在克隆项目后直接启动：
