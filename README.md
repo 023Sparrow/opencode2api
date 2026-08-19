@@ -9,7 +9,8 @@
 - 支持普通响应和 SSE 流式响应
 - 支持文本、图片、thinking/reasoning、工具定义、工具调用和工具结果转换
 - 分离配置 Zen key 池与 Zen Go key 池
-- 支持无需上游 key 的 Zen 匿名模式，免费模型优先按代理出口 IP 轮换并可回退 Zen key
+- 支持无需上游 key 的 Zen 匿名模式，兼容型免费模型可按代理节点轮换并回退 Zen key
+- 每 24 小时从 models.dev 更新 OpenCode 成本与弃用信息，以兼容规则判断匿名资格
 - 模型同时存在于两个上游时按 `prefer` 配置优先使用 Go 或 Zen（默认 Go）
 - 支持直连、HTTP、HTTPS、SOCKS5 和 SOCKS5H 代理
 - 支持从文本文件读取代理池，并与配置内的代理合并、去重
@@ -19,10 +20,10 @@
 - 代理失败后自动迁移绑定，key 失败后进行短时冷却
 - 根据真实上游流量识别代理故障，并每 15 分钟通过 Cloudflare trace 并行复查异常代理
 - 为不同会话生成不同的 OpenCode 会话 ID，并支持 `x-opencode-session`、`x-session-id` 和 `conversation-id` 显式指定会话
-- 内置独立端口 WebUI，可管理配置、查看运行指标、key/proxy 状态与实时日志
+- 内置独立端口 Field Manual WebUI，可管理配置、查看 Token/上游指标、诊断路由、运行三协议 Playground 与订阅实时日志
 - WebUI 使用账号密码、服务端 session、HttpOnly Cookie、CSRF 与登录限速保护
 - WebUI 保存后原子写入配置并热切换 Gateway；无效配置不会影响当前流量
-- stdout 输出结构化 JSON 日志，最近事件与一小时滚动指标保存在有限内存中
+- stdout 输出结构化 JSON 日志；请求、Token、上游尝试与最近一小时滚动指标仅保存在进程内存中
 
 ## API 路径
 
@@ -38,6 +39,8 @@
 
 模型目录的过期阈值为 `models.refresh_seconds` 的两倍，且不低于 60 秒。刚启动时短暂返回 `503 starting` 属于正常现象，模型列表首次刷新成功后会变为 `200 ok`。
 
+健康检查不会计入请求指标。它也不会触发 models.dev 刷新或写入任何监控记录。
+
 ## WebUI
 
 示例配置会在独立的 `8081` 端口启动管理界面：
@@ -48,7 +51,54 @@ http://服务器地址:8081
 
 首次账号为 `admin`，密码来自 `webui.password`。服务第一次成功启动时会使用 Argon2id 将密码转换为带盐哈希，写入 `webui.password_hash`，并从配置中删除明文密码。请在首次登录后立即修改示例密码。
 
-WebUI 可查看最近一小时的请求率、成功率、状态码与延迟分位，监控活跃请求/流、模型、key 冷却和 proxy 健康状态；实时日志通过 SSE 推送。监控和最近日志仅保存在内存，服务重启后清空，stdout 日志仍可由 Docker 或日志平台收集。
+Field Manual WebUI 包含运行桌面、六步首次运行检查、接入手册、Token 用量、三协议 Playground、路由诊断、配置、事件日志和账号安全页面。接入手册会生成 Chat、Responses、Anthropic、Python 和 JavaScript 示例，但始终使用 `YOUR_API_KEY` 占位符，不把真实 Server Key 写入页面。
+
+Token 页面展示用量覆盖率、每分钟趋势、模型排行与 Zen/Go Tier 分布。诊断页展示 models.dev 状态、模型原生协议与匿名判断来源、Key/代理状态、逐次上游尝试以及最近一次 Playground 追踪；实时日志通过 SSE 推送。所有动态管理数据都以 DOM 文本节点渲染。
+
+监控、上游尝试、最近 Playground 结果和日志仅保存在内存。**进程重启会清空全部监控与诊断历史，包括 lifetime 累计。** stdout 日志仍可由 Docker 或日志平台收集；models.dev 价格快取是独立的磁盘兼容资料，不属于监控历史。
+
+### 监控字段
+
+登录 WebUI 后，`GET /api/monitor` 返回以下顶层字段；该管理 API 只在 `webui.listen` 上提供，并受 Session 保护：
+
+| 字段 | 内容 |
+| --- | --- |
+| `version` | 当前程序版本。 |
+| `metrics` | 原有请求统计：进程启动时间、活跃请求/流、lifetime 与最近一小时成功率/延迟、端点/模型/Tier/状态码聚合，以及 60 个每分钟序列点。 |
+| `usage` | Token 的 `lifetime` 与 `last_hour` 统计。包含 `requests`、`reported`、`coverage`、总 Token 和按模型/Tier 聚合。 |
+| `upstream` | 上游尝试的 `lifetime`、`last_hour` 与 `recent`。按 Tier、匿名/Key 通道、Key 指纹聚合。 |
+| `resources` | 模型目录、Key 冷却、脱敏代理节点、匿名开关和 models.dev metadata 状态。 |
+
+`usage.*.tokens` 与模型/Tier 项均包含 `input_tokens`、`output_tokens`、`cached_tokens`、`reasoning_tokens`、`total_tokens`。`metrics.series` 的每分钟点也包含这些 Token 字段和 `usage_reported`。普通 JSON、同协议 SSE 与跨协议 SSE 响应都会解析上游 usage；`coverage` 是收到 usage 的推理请求数除以已建立上游路由的推理请求数。上游未提供 usage 时不会估算 Token。
+
+每个 `upstream.recent` 项包含时间、Request ID、模型、Tier、尝试序号、匿名标记、通道、Key 指纹、`proxy_node`、HTTP 状态、耗时、成功标记和结果分类。匿名请求的 Key ID 固定显示为 `anonymous`；真实 Key 只显示 SHA-256 稳定短指纹。代理 URL 的认证信息会被移除，字段名称明确为代理节点而非出口 IP。
+
+lifetime 从当前进程启动开始；last hour 使用 60 个一分钟 Bucket。管理响应最多返回最近 500 次一小时内上游尝试，WebUI 默认显示最后 100 次。数据不会写入配置、metadata 快取或其他数据库。
+
+### Playground 与诊断 API
+
+以下接口受管理 Session 保护；POST 还要求当前 CSRF Token，并按客户端每分钟最多 12 次限制：
+
+| 方法 | 路径 | 用途 |
+| --- | --- | --- |
+| `GET` | `/api/debug/models` | 模型路由、原生协议、协议来源、Zen/Go 可用性、匿名资格/来源、成本与 metadata 状态。 |
+| `POST` | `/api/debug/inference` | 通过真实 Gateway 发起 Chat、Responses 或 Anthropic 非流式诊断请求。 |
+
+请求格式：
+
+```json
+{
+  "protocol": "chat",
+  "request": {
+    "model": "example-model",
+    "messages": [{"role": "user", "content": "Hello"}]
+  }
+}
+```
+
+`protocol` 可为 `chat`、`responses` 或 `anthropic`。服务端无条件把内层 `stream` 改为 `false`。诊断结果统一包含 `ok`、真实 `http_status`、`duration_ms`、`request_id`、`route` 和原始协议 `response`。一旦诊断调用已执行，管理接口本身返回 HTTP `200`，即使上游结果是 4xx/5xx；因此错误正文、路由和 Request ID 仍可一起查看。外层请求格式、Session、CSRF 或限速错误仍使用相应管理 HTTP 状态。
+
+诊断响应不会包含本地 Server Key、上游 Key、Cookie、密码、Authorization 或代理凭据；响应中同名敏感字段及已配置敏感值会在返回浏览器前清除。最近一次结果只保存在当前管理进程内。
 
 ## 编译
 
@@ -153,7 +203,7 @@ cp config.example.json config.json
 | `server_keys` | 调用本代理时使用的本地 API key 列表。它们只用于本地鉴权，不会发送给 OpenCode。 |
 | `zen_keys` | OpenCode Zen API key 池。允许配置多个 key。 |
 | `go_keys` | OpenCode Zen Go API key 池。没有 Go key 时可以使用空数组。 |
-| `anonymous` | 是否启用 Zen 匿名模式，默认 `false`。启用后模型 ID 包含 `free` 时优先使用 OpenCode 的 `public` 凭证。 |
+| `anonymous` | 是否启用 Zen 匿名模式，默认 `false`。匿名资格由 models.dev 已知资料优先、名称规则回退的兼容逻辑决定。 |
 | `prefer` | 模型同时存在于 Zen 与 Go 时优先使用的上游，值为 `go` 或 `zen`，默认 `go`。仅存在于某一池时不受影响。 |
 | `proxyfile` | 可选代理池文件路径。相对路径以 `config.json` 所在目录为基准；内容会追加到 `proxies` 并去重。 |
 | `proxies` | 上游代理列表。支持 `direct`、`http://`、`https://`、`socks5://` 和 `socks5h://`。URL 可以包含代理用户名和密码。 |
@@ -164,9 +214,17 @@ cp config.example.json config.json
 
 OpenCode 客户端在没有配置 Zen key 时使用固定的 `public` 凭证；Zen 服务端将它转换为匿名请求，并按出口 IP 对允许匿名访问的模型限流。本项目使用相同协议：OpenAI/Responses 上游请求发送 `Authorization: Bearer public`，Anthropic 上游请求发送 `x-api-key: public`。
 
-启用 `anonymous` 后，模型 ID 大小写不敏感地包含 `free` 时优先走匿名 Zen。遇到网络错误、401、403、429 或 5xx 会切换到下一个健康 proxy；429 的 `Retry-After` 只冷却对应 proxy 的匿名通道。匿名阶段最多尝试 `retry.max_attempts` 个不同 proxy，全部失败后若存在真实 `zen_keys`，再以独立的重试预算回退 Zen key 池。其他 4xx 属于确定性的请求错误，不切换 proxy 或 key。
+启用 `anonymous` 后，匿名资格按以下顺序判断：
 
-`/v1/models` 保持现有模型目录行为，不会因为启用匿名模式而只保留免费模型。匿名模式本身只能为名称包含 `free` 的 Zen 模型建立无 key 路由；其他模型仍需要真实 Zen/Go key。
+1. models.dev 已知输入、输出成本都为 `0`，且模型未弃用：允许匿名，不要求名称含 `free`。
+2. models.dev 已知为付费或已弃用：拒绝匿名，即使模型名称含 `free`。
+3. metadata 尚未就绪、模型缺失，或输入/输出任一成本未知：回退现有名称规则，模型 ID 大小写不敏感地包含 `free` 时允许匿名。
+
+符合资格的模型优先走匿名 Zen。遇到网络错误、401、403、429 或 5xx 会切换到下一个健康 proxy 节点；429 的 `Retry-After` 只冷却对应节点的匿名通道。匿名阶段最多尝试 `retry.max_attempts` 个不同节点，全部失败后若存在真实 `zen_keys`，再以独立的重试预算回退 Zen key 池。其他 4xx 属于确定性的请求错误，不切换 proxy 或 key。监控中的 `proxy_node` 表示所选代理节点，不代表或推断实际出口 IP。
+
+只有匿名通道、且 `zen_keys` 与 `go_keys` 都为空时，`/v1/models` 只展示按上述规则可匿名使用的模型。只要配置了任一真实上游 Key，模型列表仍展示该 Key 路由可用的完整模型集合。
+
+models.dev 使用固定 30 秒超时，每 24 小时刷新一次。标准地址为 `https://models.dev/api.json`；规范化后的 OpenCode 模型成本缓存在 `config.json.models.dev.json`，以 `0600` 权限和同目录临时文件原子替换。启动会先读取可用快取，再尝试联网更新；更新失败不会丢弃旧资料，错误、更新时间与过期状态可在监控资源和诊断页查看。
 
 ### key 与代理分配规则
 
@@ -244,9 +302,13 @@ socks5://127.0.0.1:1080  # 备用代理
 
 模型同时存在于 Zen 与 Go 时按 `prefer` 配置选择：值为 `go` 时优先 Go，值为 `zen` 时优先 Zen（默认 `go`）。仅存在于某一池时才使用该池的 key。
 
+`deepseek-v4-flash-free` 默认使用 Chat 原生协议。与所有模型一样，`models.protocols` 中的显式映射优先于该默认值和名称推断。
+
 ### Thinking 工具历史兼容
 
 所有请求都会经过同一个上游请求准备流程，同协议转发和跨协议转换不再使用两套分支。通过 Chat Completions 或 Anthropic Messages API 调用 DeepSeek、Kimi/Moonshot 或 MiMo 模型时，代理会按上游的目标协议规范化 assistant 工具历史：Chat 补全缺失或空的 `reasoning_content`；Anthropic 保留有效 thinking 文本、为缺失或空的 thinking 补充兼容占位内容、将 `redacted_thinking` 转为普通 thinking，并移除这些兼容端点不接受的 `signature`。显式启用 reasoning/thinking 的别名模型也会启用该处理，普通非 reasoning 请求不会被修改。
+
+跨协议桥接会区分 Chat/Responses 的 system 与 developer 指令，在 Anthropic 目标中按顺序合并为 system 内容；reasoning effort 会转换为兼容 thinking 预算。工具选择、空参数 `{}`、停止原因，以及 SSE 中延迟到达的工具名称、参数分片和完成事件也会转换到目标协议的对应形态。
 
 ### `performance`
 
@@ -266,7 +328,7 @@ socks5://127.0.0.1:1080  # 备用代理
 | `logging.level` | 日志级别，支持 `debug`、`info`、`warn` 和 `error`，可通过 WebUI 热切换。 |
 | `logging.ring_size` | WebUI 最近日志环容量，范围 100–50000，默认 2000。stdout 不受此容量限制。 |
 
-每条 stdout 日志都是单行 JSON，包含时间、级别、组件、事件以及适用的 request ID、模型、tier、状态码、耗时和重试次数。日志不会输出完整上游 key、本地 key、Authorization、Cookie、代理认证信息或请求消息正文。
+每条 stdout 日志都是单行 JSON，包含时间、级别、组件、事件以及适用的 request ID、模型、tier、状态码、耗时和重试次数。普通“请求完成”事件使用 `debug` 级别，避免 `info` 日志被每个成功请求淹没；警告和错误仍按原级别输出。日志不会输出完整上游 key、本地 key、Authorization、Cookie、代理认证信息或请求消息正文。
 
 ### `webui`
 
