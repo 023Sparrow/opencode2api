@@ -288,11 +288,13 @@ func (h *hubHandler) addAttr(fields map[string]any, attr slog.Attr) {
 }
 
 type requestMeta struct {
-	Model    string
-	Tier     string
-	Request  string
-	Attempts int
-	Stream   bool
+	Model         string
+	Tier          string
+	Request       string
+	Attempts      int
+	Stream        bool
+	Usage         bridgeUsage
+	UsageReported bool
 }
 
 type requestMetaKey struct{}
@@ -303,37 +305,116 @@ func metaFromRequest(r *http.Request) *requestMeta {
 }
 
 type metricBucket struct {
-	minute    int64
-	total     uint64
-	success   uint64
-	errors    uint64
-	duration  uint64
-	histogram [11]uint64
-	endpoints map[string]uint64
-	models    map[string]uint64
-	tiers     map[string]uint64
-	statuses  map[string]uint64
+	minute        int64
+	total         uint64
+	success       uint64
+	errors        uint64
+	duration      uint64
+	histogram     [11]uint64
+	endpoints     map[string]uint64
+	models        map[string]uint64
+	tiers         map[string]uint64
+	statuses      map[string]uint64
+	usageRequests uint64
+	usageReported uint64
+	tokens        TokenCounts
+	usageModels   map[string]TokenCounts
+	usageTiers    map[string]TokenCounts
 }
 
 func (b *metricBucket) reset(minute int64) {
 	*b = metricBucket{
 		minute: minute, endpoints: make(map[string]uint64), models: make(map[string]uint64),
 		tiers: make(map[string]uint64), statuses: make(map[string]uint64),
+		usageModels: make(map[string]TokenCounts), usageTiers: make(map[string]TokenCounts),
 	}
 }
 
-type Monitor struct {
-	started       time.Time
-	active        atomic.Int64
-	activeStreams atomic.Int64
-	total         atomic.Uint64
-	success       atomic.Uint64
-	errors        atomic.Uint64
-	mu            sync.Mutex
-	buckets       [60]metricBucket
+type TokenCounts struct {
+	Input     uint64 `json:"input_tokens"`
+	Output    uint64 `json:"output_tokens"`
+	Cached    uint64 `json:"cached_tokens"`
+	Reasoning uint64 `json:"reasoning_tokens"`
+	Total     uint64 `json:"total_tokens"`
 }
 
-func NewMonitor() *Monitor { return &Monitor{started: time.Now().UTC()} }
+type UsagePeriod struct {
+	Requests uint64                 `json:"requests"`
+	Reported uint64                 `json:"reported"`
+	Coverage float64                `json:"coverage"`
+	Tokens   TokenCounts            `json:"tokens"`
+	Models   map[string]TokenCounts `json:"models"`
+	Tiers    map[string]TokenCounts `json:"tiers"`
+}
+
+type UsageSnapshot struct {
+	Lifetime UsagePeriod `json:"lifetime"`
+	Window   UsagePeriod `json:"last_hour"`
+}
+
+type AttemptCounts struct {
+	Total   uint64 `json:"total"`
+	Success uint64 `json:"success"`
+	Failed  uint64 `json:"failed"`
+}
+
+type AttemptAggregate struct {
+	AttemptCounts
+	SuccessRate float64                  `json:"success_rate"`
+	Tiers       map[string]AttemptCounts `json:"tiers"`
+	Channels    map[string]AttemptCounts `json:"channels"`
+	Keys        map[string]AttemptCounts `json:"keys"`
+}
+
+type UpstreamAttempt struct {
+	Time       time.Time `json:"time"`
+	RequestID  string    `json:"request_id"`
+	Model      string    `json:"model"`
+	Tier       string    `json:"tier"`
+	Attempt    int       `json:"attempt"`
+	KeyID      string    `json:"key_id"`
+	Channel    string    `json:"channel"`
+	Anonymous  bool      `json:"anonymous"`
+	Proxy      string    `json:"proxy_node"`
+	Status     int       `json:"status,omitempty"`
+	DurationMS int64     `json:"duration_ms"`
+	Success    bool      `json:"success"`
+	Outcome    string    `json:"outcome"`
+}
+
+type attemptBucket struct {
+	minute    int64
+	aggregate AttemptAggregate
+}
+
+type UpstreamSnapshot struct {
+	Lifetime AttemptAggregate  `json:"lifetime"`
+	Window   AttemptAggregate  `json:"last_hour"`
+	Recent   []UpstreamAttempt `json:"recent"`
+}
+
+type Monitor struct {
+	started         time.Time
+	active          atomic.Int64
+	activeStreams   atomic.Int64
+	total           atomic.Uint64
+	success         atomic.Uint64
+	errors          atomic.Uint64
+	mu              sync.Mutex
+	buckets         [60]metricBucket
+	lifetimeUsage   UsagePeriod
+	attemptLifetime AttemptAggregate
+	attemptBuckets  [60]attemptBucket
+	recentAttempts  []UpstreamAttempt
+}
+
+func NewMonitor() *Monitor {
+	return &Monitor{
+		started:         time.Now().UTC(),
+		lifetimeUsage:   newUsagePeriod(),
+		attemptLifetime: newAttemptAggregate(),
+	}
+}
 
 var latencyBounds = [...]uint64{50, 100, 250, 500, 1000, 2500, 5000, 10000, 30000, 60000}
 
@@ -374,8 +455,48 @@ func (m *Monitor) Record(endpoint string, status int, duration time.Duration, me
 		}
 		if meta.Tier != "" {
 			bucket.tiers[meta.Tier]++
+			bucket.usageRequests++
+			m.lifetimeUsage.Requests++
+			if meta.UsageReported {
+				bucket.usageReported++
+				m.lifetimeUsage.Reported++
+			}
+			tokens := tokenCounts(meta.Usage)
+			addTokenCounts(&bucket.tokens, tokens)
+			addTokenCounts(&m.lifetimeUsage.Tokens, tokens)
+			addTokenMap(bucket.usageModels, meta.Model, tokens)
+			addTokenMap(bucket.usageTiers, meta.Tier, tokens)
+			addTokenMap(m.lifetimeUsage.Models, meta.Model, tokens)
+			addTokenMap(m.lifetimeUsage.Tiers, meta.Tier, tokens)
 		}
 	}
+	m.mu.Unlock()
+}
+
+func (m *Monitor) RecordAttempt(attempt UpstreamAttempt) {
+	if attempt.Time.IsZero() {
+		attempt.Time = time.Now().UTC()
+	} else {
+		attempt.Time = attempt.Time.UTC()
+	}
+	minute := attempt.Time.Unix() / 60
+	m.mu.Lock()
+	recordAttemptAggregate(&m.attemptLifetime, attempt)
+	bucket := &m.attemptBuckets[minute%60]
+	if bucket.minute != minute {
+		*bucket = attemptBucket{minute: minute, aggregate: newAttemptAggregate()}
+	}
+	recordAttemptAggregate(&bucket.aggregate, attempt)
+	cutoff := attempt.Time.Add(-time.Hour)
+	first := 0
+	for first < len(m.recentAttempts) && m.recentAttempts[first].Time.Before(cutoff) {
+		first++
+	}
+	if first > 0 {
+		copy(m.recentAttempts, m.recentAttempts[first:])
+		m.recentAttempts = m.recentAttempts[:len(m.recentAttempts)-first]
+	}
+	m.recentAttempts = append(m.recentAttempts, attempt)
 	m.mu.Unlock()
 }
 
@@ -391,6 +512,8 @@ type MonitorSnapshot struct {
 	Models        map[string]uint64 `json:"models"`
 	Tiers         map[string]uint64 `json:"tiers"`
 	Statuses      map[string]uint64 `json:"statuses"`
+	Usage         UsageSnapshot     `json:"usage"`
+	Upstream      UpstreamSnapshot  `json:"upstream"`
 }
 
 type MetricSummary struct {
@@ -405,10 +528,16 @@ type MetricSummary struct {
 }
 
 type MetricSeries struct {
-	Minute  time.Time `json:"minute"`
-	Total   uint64    `json:"total"`
-	Success uint64    `json:"success"`
-	Errors  uint64    `json:"errors"`
+	Minute          time.Time `json:"minute"`
+	Total           uint64    `json:"total"`
+	Success         uint64    `json:"success"`
+	Errors          uint64    `json:"errors"`
+	InputTokens     uint64    `json:"input_tokens"`
+	OutputTokens    uint64    `json:"output_tokens"`
+	CachedTokens    uint64    `json:"cached_tokens"`
+	ReasoningTokens uint64    `json:"reasoning_tokens"`
+	TotalTokens     uint64    `json:"total_tokens"`
+	UsageReported   uint64    `json:"usage_reported"`
 }
 
 func (m *Monitor) Snapshot() MonitorSnapshot {
@@ -417,6 +546,9 @@ func (m *Monitor) Snapshot() MonitorSnapshot {
 	var histogram [11]uint64
 	endpoints, models, tiers, statuses := map[string]uint64{}, map[string]uint64{}, map[string]uint64{}, map[string]uint64{}
 	series := make([]MetricSeries, 0, 60)
+	usageWindow := newUsagePeriod()
+	upstreamWindow := newAttemptAggregate()
+	var recentAttempts []UpstreamAttempt
 	m.mu.Lock()
 	for offset := int64(59); offset >= 0; offset-- {
 		minute := nowMinute - offset
@@ -424,6 +556,9 @@ func (m *Monitor) Snapshot() MonitorSnapshot {
 		entry := MetricSeries{Minute: time.Unix(minute*60, 0).UTC()}
 		if bucket.minute == minute {
 			entry.Total, entry.Success, entry.Errors = bucket.total, bucket.success, bucket.errors
+			entry.InputTokens, entry.OutputTokens = bucket.tokens.Input, bucket.tokens.Output
+			entry.CachedTokens, entry.ReasoningTokens, entry.TotalTokens = bucket.tokens.Cached, bucket.tokens.Reasoning, bucket.tokens.Total
+			entry.UsageReported = bucket.usageReported
 			window.Total += bucket.total
 			window.Success += bucket.success
 			window.Errors += bucket.errors
@@ -435,10 +570,34 @@ func (m *Monitor) Snapshot() MonitorSnapshot {
 			mergeCounts(models, bucket.models)
 			mergeCounts(tiers, bucket.tiers)
 			mergeCounts(statuses, bucket.statuses)
+			usageWindow.Requests += bucket.usageRequests
+			usageWindow.Reported += bucket.usageReported
+			addTokenCounts(&usageWindow.Tokens, bucket.tokens)
+			mergeTokenMaps(usageWindow.Models, bucket.usageModels)
+			mergeTokenMaps(usageWindow.Tiers, bucket.usageTiers)
+		}
+		attemptBucket := &m.attemptBuckets[minute%60]
+		if attemptBucket.minute == minute {
+			mergeAttemptAggregate(&upstreamWindow, attemptBucket.aggregate)
 		}
 		series = append(series, entry)
 	}
+	usageLifetime := cloneUsagePeriod(m.lifetimeUsage)
+	upstreamLifetime := cloneAttemptAggregate(m.attemptLifetime)
+	cutoff := time.Now().Add(-time.Hour)
+	for _, attempt := range m.recentAttempts {
+		if !attempt.Time.Before(cutoff) {
+			recentAttempts = append(recentAttempts, attempt)
+		}
+	}
+	if len(recentAttempts) > 500 {
+		recentAttempts = recentAttempts[len(recentAttempts)-500:]
+	}
 	m.mu.Unlock()
+	finalizeUsagePeriod(&usageLifetime)
+	finalizeUsagePeriod(&usageWindow)
+	finalizeAttemptAggregate(&upstreamLifetime)
+	finalizeAttemptAggregate(&upstreamWindow)
 	if window.Total > 0 {
 		window.SuccessRate = float64(window.Success) / float64(window.Total)
 		window.AverageMS /= float64(window.Total)
@@ -454,12 +613,124 @@ func (m *Monitor) Snapshot() MonitorSnapshot {
 		StartedAt: m.started, UptimeSeconds: int64(time.Since(m.started).Seconds()), Active: m.active.Load(),
 		ActiveStreams: m.activeStreams.Load(), Lifetime: lifetime, Window: window, Series: series,
 		Endpoints: endpoints, Models: models, Tiers: tiers, Statuses: statuses,
+		Usage:    UsageSnapshot{Lifetime: usageLifetime, Window: usageWindow},
+		Upstream: UpstreamSnapshot{Lifetime: upstreamLifetime, Window: upstreamWindow, Recent: recentAttempts},
 	}
 }
 
 func mergeCounts(target, source map[string]uint64) {
 	for key, value := range source {
 		target[key] += value
+	}
+}
+
+func newUsagePeriod() UsagePeriod {
+	return UsagePeriod{Models: make(map[string]TokenCounts), Tiers: make(map[string]TokenCounts)}
+}
+
+func tokenCounts(usage bridgeUsage) TokenCounts {
+	return TokenCounts{
+		Input: uint64(max(usage.Input, 0)), Output: uint64(max(usage.Output, 0)),
+		Cached: uint64(max(usage.Cached, 0)), Reasoning: uint64(max(usage.Reasoning, 0)), Total: uint64(max(usage.Total, 0)),
+	}
+}
+
+func addTokenCounts(target *TokenCounts, source TokenCounts) {
+	target.Input += source.Input
+	target.Output += source.Output
+	target.Cached += source.Cached
+	target.Reasoning += source.Reasoning
+	target.Total += source.Total
+}
+
+func addTokenMap(target map[string]TokenCounts, key string, value TokenCounts) {
+	if key == "" {
+		return
+	}
+	current := target[key]
+	addTokenCounts(&current, value)
+	target[key] = current
+}
+
+func mergeTokenMaps(target, source map[string]TokenCounts) {
+	for key, value := range source {
+		addTokenMap(target, key, value)
+	}
+}
+
+func cloneUsagePeriod(source UsagePeriod) UsagePeriod {
+	result := newUsagePeriod()
+	result.Requests, result.Reported, result.Tokens = source.Requests, source.Reported, source.Tokens
+	mergeTokenMaps(result.Models, source.Models)
+	mergeTokenMaps(result.Tiers, source.Tiers)
+	return result
+}
+
+func finalizeUsagePeriod(period *UsagePeriod) {
+	if period.Requests > 0 {
+		period.Coverage = float64(period.Reported) / float64(period.Requests)
+	}
+}
+
+func newAttemptAggregate() AttemptAggregate {
+	return AttemptAggregate{
+		Tiers: make(map[string]AttemptCounts), Channels: make(map[string]AttemptCounts), Keys: make(map[string]AttemptCounts),
+	}
+}
+
+func recordAttemptAggregate(target *AttemptAggregate, attempt UpstreamAttempt) {
+	recordAttemptCounts(&target.AttemptCounts, attempt.Success)
+	addAttemptMap(target.Tiers, attempt.Tier, attempt.Success)
+	addAttemptMap(target.Channels, attempt.Channel, attempt.Success)
+	addAttemptMap(target.Keys, attempt.KeyID, attempt.Success)
+}
+
+func recordAttemptCounts(target *AttemptCounts, success bool) {
+	target.Total++
+	if success {
+		target.Success++
+	} else {
+		target.Failed++
+	}
+}
+
+func addAttemptMap(target map[string]AttemptCounts, key string, success bool) {
+	if key == "" {
+		return
+	}
+	current := target[key]
+	recordAttemptCounts(&current, success)
+	target[key] = current
+}
+
+func mergeAttemptAggregate(target *AttemptAggregate, source AttemptAggregate) {
+	target.Total += source.Total
+	target.Success += source.Success
+	target.Failed += source.Failed
+	mergeAttemptMaps(target.Tiers, source.Tiers)
+	mergeAttemptMaps(target.Channels, source.Channels)
+	mergeAttemptMaps(target.Keys, source.Keys)
+}
+
+func mergeAttemptMaps(target, source map[string]AttemptCounts) {
+	for key, value := range source {
+		current := target[key]
+		current.Total += value.Total
+		current.Success += value.Success
+		current.Failed += value.Failed
+		target[key] = current
+	}
+}
+
+func cloneAttemptAggregate(source AttemptAggregate) AttemptAggregate {
+	result := newAttemptAggregate()
+	mergeAttemptAggregate(&result, source)
+	return result
+}
+
+func finalizeAttemptAggregate(aggregate *AttemptAggregate) {
+	if aggregate.Total > 0 {
+		aggregate.SuccessRate = float64(aggregate.Success) / float64(aggregate.Total)
 	}
 }
 
@@ -509,6 +780,10 @@ func (w *statusWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
 func monitorMiddleware(monitor *Monitor, logger *slog.Logger, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" {
+			next.ServeHTTP(w, r)
+			return
+		}
 		started := time.Now()
 		meta := &requestMeta{}
 		r = r.WithContext(context.WithValue(r.Context(), requestMetaKey{}, meta))
@@ -522,7 +797,7 @@ func monitorMiddleware(monitor *Monitor, logger *slog.Logger, next http.Handler)
 			}
 			duration := time.Since(started)
 			monitor.Record(r.URL.Path, status, duration, meta)
-			logger.Info("request completed", "component", "http", "event", "request_complete", "method", r.Method,
+			logger.Debug("request completed", "component", "http", "event", "request_complete", "method", r.Method,
 				"path", r.URL.Path, "status", status, "duration_ms", duration.Milliseconds(), "bytes", writer.bytes,
 				"request_id", meta.Request, "model", meta.Model, "tier", meta.Tier, "attempts", meta.Attempts, "stream", meta.Stream)
 		}()

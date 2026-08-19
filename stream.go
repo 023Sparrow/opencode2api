@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -35,9 +36,14 @@ type bridgeStreamParser struct {
 }
 
 func transcodeStream(w http.ResponseWriter, reader io.Reader, from, to Protocol, model string) error {
+	_, _, err := transcodeStreamWithUsage(w, reader, from, to, model)
+	return err
+}
+
+func transcodeStreamWithUsage(w http.ResponseWriter, reader io.Reader, from, to Protocol, model string) (bridgeUsage, bool, error) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		return fmt.Errorf("response writer does not support streaming")
+		return bridgeUsage{}, false, fmt.Errorf("response writer does not support streaming")
 	}
 	parser := &bridgeStreamParser{
 		protocol:          from,
@@ -60,9 +66,78 @@ func transcodeStream(w http.ResponseWriter, reader io.Reader, from, to Protocol,
 		}
 		return nil
 	}); err != nil {
-		return err
+		return emitter.usage, emitter.usageReported, err
 	}
-	return emitter.Finish()
+	return emitter.usage, emitter.usageReported, emitter.Finish()
+}
+
+type streamUsageObserver struct {
+	parser   *bridgeStreamParser
+	buffer   []byte
+	usage    bridgeUsage
+	reported bool
+}
+
+func newStreamUsageObserver(protocol Protocol) *streamUsageObserver {
+	return &streamUsageObserver{parser: &bridgeStreamParser{
+		protocol: protocol, tools: map[string]bool{}, toolIDs: map[string]string{}, toolNames: map[string]string{},
+		responseArgs: map[string]bool{}, responseReasoning: map[string]bool{},
+	}}
+}
+
+func (observer *streamUsageObserver) Write(data []byte) (int, error) {
+	observer.buffer = append(observer.buffer, data...)
+	for {
+		index, width := nextSSEBoundary(observer.buffer)
+		if index < 0 {
+			break
+		}
+		frame := append([]byte(nil), observer.buffer[:index+width]...)
+		observer.buffer = observer.buffer[index+width:]
+		observer.consume(frame)
+	}
+	return len(data), nil
+}
+
+func (observer *streamUsageObserver) Finish() bridgeUsage {
+	if len(observer.buffer) > 0 {
+		observer.consume(observer.buffer)
+		observer.buffer = nil
+	}
+	return observer.usage
+}
+
+func (observer *streamUsageObserver) Reported() bool { return observer.reported }
+
+func (observer *streamUsageObserver) consume(frame []byte) {
+	_ = readSSE(strings.NewReader(string(frame)), func(eventName, data string) error {
+		events, err := observer.parser.Parse(eventName, data)
+		if err != nil {
+			return nil
+		}
+		for _, event := range events {
+			if event.Usage != nil {
+				observer.reported = true
+				mergeBridgeUsage(&observer.usage, *event.Usage)
+			}
+		}
+		return nil
+	})
+}
+
+func nextSSEBoundary(data []byte) (int, int) {
+	lf := bytes.Index(data, []byte("\n\n"))
+	crlf := bytes.Index(data, []byte("\r\n\r\n"))
+	if lf < 0 {
+		if crlf < 0 {
+			return -1, 0
+		}
+		return crlf, 4
+	}
+	if crlf >= 0 && crlf < lf {
+		return crlf, 4
+	}
+	return lf, 2
 }
 
 func readSSE(reader io.Reader, handler func(eventName, data string) error) error {
@@ -380,6 +455,7 @@ type bridgeStreamEmitter struct {
 	done               bool
 	stop               string
 	usage              bridgeUsage
+	usageReported      bool
 	text               strings.Builder
 	reasoning          strings.Builder
 	reasoningSignature strings.Builder
@@ -471,6 +547,7 @@ func (emitter *bridgeStreamEmitter) Emit(event bridgeStreamEvent) error {
 		return emitter.emitPendingToolArguments(tool)
 	case "usage":
 		if event.Usage != nil {
+			emitter.usageReported = true
 			mergeBridgeUsage(&emitter.usage, *event.Usage)
 		}
 	case "finish":
@@ -944,7 +1021,7 @@ func mergeBridgeUsage(destination *bridgeUsage, source bridgeUsage) {
 		destination.Output = source.Output
 	}
 	if source.Total != 0 {
-		destination.Total = source.Total
+		destination.Total = max(destination.Total, source.Total)
 	}
 	if source.Cached != 0 {
 		destination.Cached = source.Cached
@@ -952,7 +1029,5 @@ func mergeBridgeUsage(destination *bridgeUsage, source bridgeUsage) {
 	if source.Reasoning != 0 {
 		destination.Reasoning = source.Reasoning
 	}
-	if destination.Total == 0 {
-		destination.Total = destination.Input + destination.Output
-	}
+	destination.Total = max(destination.Total, destination.Input+destination.Output)
 }

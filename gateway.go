@@ -284,10 +284,18 @@ func (g *Gateway) handleInference(external Protocol) http.HandlerFunc {
 			w.Header().Set("Cache-Control", "no-cache")
 			w.Header().Set("X-Accel-Buffering", "no")
 			w.WriteHeader(resp.StatusCode)
+			var usage bridgeUsage
+			var usageReported bool
 			if external == route.Protocol {
-				_, err = io.Copy(w, resp.Body)
+				observer := newStreamUsageObserver(route.Protocol)
+				_, err = io.Copy(w, io.TeeReader(resp.Body, observer))
+				usage = observer.Finish()
+				usageReported = observer.Reported()
 			} else {
-				err = transcodeStream(w, resp.Body, route.Protocol, external, model)
+				usage, usageReported, err = transcodeStreamWithUsage(w, resp.Body, route.Protocol, external, model)
+			}
+			if meta != nil {
+				meta.Usage, meta.UsageReported = usage, usageReported
 			}
 			if err != nil && !errors.Is(err, context.Canceled) {
 				g.logger.Debug("downstream stream ended with an error", "component", "stream", "event", "stream_failed", "request_id", ids.Request, "model", model, "tier", route.Tier, "error", err)
@@ -298,6 +306,9 @@ func (g *Gateway) handleInference(external Protocol) http.HandlerFunc {
 		if err != nil {
 			writeAPIError(w, external, http.StatusBadGateway, "failed to read upstream response", "upstream_error", ids.Request)
 			return
+		}
+		if usage, reported := extractResponseUsage(route.Protocol, responseBody); meta != nil {
+			meta.Usage, meta.UsageReported = usage, reported
 		}
 		if external != route.Protocol {
 			responseBody, err = convertResponse(route.Protocol, external, responseBody)
@@ -362,6 +373,7 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route modelRoute, bod
 			status = resp.StatusCode
 		}
 		g.syncProxyResult(ctx, node.proxy, status, err)
+		g.recordUpstreamAttempt(route, ids, attempts, "anonymous", "anonymous", true, node.proxy, resp, err, duration)
 		if err == nil && resp.StatusCode/100 == 2 {
 			g.anonymous.MarkSuccess(node)
 			g.logger.Debug("anonymous upstream accepted request", "component", "upstream", "event", "anonymous_attempt_succeeded", "request_id", ids.Request, "attempt", attempts, "tier", TierZen, "proxy", redactURL(node.proxy.name), "status", resp.StatusCode, "duration_ms", duration.Milliseconds())
@@ -434,6 +446,7 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route modelRoute, body []by
 			status = resp.StatusCode
 		}
 		proxyFailed := g.syncProxyResult(ctx, proxy, status, err)
+		g.recordUpstreamAttempt(route, ids, attemptOffset+attempt, secretFingerprint(node.key), "key", false, proxy, resp, err, attemptDuration)
 		if err == nil && resp.StatusCode/100 == 2 {
 			nodes.MarkSuccess(node)
 			g.logger.Debug("upstream accepted request", "component", "upstream", "event", "attempt_succeeded", "request_id", ids.Request, "attempt", attempt, "tier", route.Tier, "key_id", secretFingerprint(node.key), "proxy", redactURL(proxy.name), "status", resp.StatusCode, "duration_ms", attemptDuration.Milliseconds())
@@ -466,6 +479,49 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route modelRoute, body []by
 		return lastResponse, nil
 	}
 	return nil, lastErr
+}
+
+func extractResponseUsage(protocol Protocol, body []byte) (bridgeUsage, bool) {
+	var payload map[string]any
+	if json.Unmarshal(body, &payload) != nil {
+		return bridgeUsage{}, false
+	}
+	usage := mapAt(payload, "usage")
+	if len(usage) == 0 {
+		return bridgeUsage{}, false
+	}
+	if protocol == ProtocolAnthropic {
+		return decodeAnthropicUsage(usage), true
+	}
+	return decodeOpenAIUsage(usage), true
+}
+
+func (g *Gateway) recordUpstreamAttempt(route modelRoute, ids requestIDs, attempt int, keyID, channel string, anonymous bool, proxy *proxyTransport, resp *http.Response, err error, duration time.Duration) {
+	if g.monitor == nil {
+		return
+	}
+	status := 0
+	if resp != nil {
+		status = resp.StatusCode
+	}
+	success := err == nil && status >= 200 && status < 300
+	outcome := "retryable_failure"
+	if success {
+		outcome = "success"
+	} else if err != nil {
+		outcome = "transport_error"
+	} else if isNonRetryableClientResponse(resp, nil) {
+		outcome = "rejected"
+	}
+	proxyName := "unavailable"
+	if proxy != nil {
+		proxyName = redactURL(proxy.name)
+	}
+	g.monitor.RecordAttempt(UpstreamAttempt{
+		Time: time.Now().UTC(), RequestID: ids.Request, Model: route.ID, Tier: string(route.Tier), Attempt: attempt,
+		KeyID: keyID, Channel: channel, Anonymous: anonymous, Proxy: proxyName, Status: status,
+		DurationMS: max(duration.Milliseconds(), 0), Success: success, Outcome: outcome,
+	})
 }
 
 func newUpstreamRequest(ctx context.Context, baseURL string, protocol Protocol, body []byte, ids requestIDs, key string) (*http.Request, error) {

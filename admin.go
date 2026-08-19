@@ -386,7 +386,10 @@ func (a *AdminServer) handleAccount(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *AdminServer) handleMonitor(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"version": version, "metrics": a.monitor.Snapshot(), "resources": a.manager.Resources()})
+	metrics := a.monitor.Snapshot()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"version": version, "metrics": metrics, "usage": metrics.Usage, "upstream": metrics.Upstream, "resources": a.manager.Resources(),
+	})
 }
 
 func (a *AdminServer) handleLogs(w http.ResponseWriter, r *http.Request) {
