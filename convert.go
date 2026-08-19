@@ -52,6 +52,7 @@ type bridgeToolChoice struct {
 type bridgeRequest struct {
 	Model       string
 	System      []bridgeBlock
+	Developer   []bridgeBlock
 	Messages    []bridgeMessage
 	Tools       []bridgeTool
 	ToolChoice  bridgeToolChoice
@@ -308,8 +309,10 @@ func decodeBridgeRequest(protocol Protocol, input map[string]any) (bridgeRequest
 				})
 			}
 			switch role {
-			case "system", "developer":
+			case "system":
 				request.System = append(request.System, blocks...)
+			case "developer":
+				request.Developer = append(request.Developer, blocks...)
 			case "tool":
 				request.Messages = append(request.Messages, bridgeMessage{Role: "user", Blocks: []bridgeBlock{{
 					Kind:   "tool_result",
@@ -340,7 +343,7 @@ func decodeBridgeRequest(protocol Protocol, input map[string]any) (bridgeRequest
 	case ProtocolResponses:
 		request.MaxTokens = input["max_output_tokens"]
 		request.Stop = input["stop"]
-		request.Reasoning = input["reasoning"]
+		request.Reasoning = firstAny(input["reasoning"], input["reasoning_effort"])
 		request.System = append(request.System, decodeOpenAIBlocks(input["instructions"])...)
 		switch value := input["input"].(type) {
 		case string:
@@ -372,8 +375,10 @@ func decodeBridgeRequest(protocol Protocol, input map[string]any) (bridgeRequest
 				case "message", "":
 					role := stringAt(item, "role")
 					blocks := decodeOpenAIBlocks(item["content"])
-					if role == "system" || role == "developer" {
+					if role == "system" {
 						request.System = append(request.System, blocks...)
+					} else if role == "developer" {
+						request.Developer = append(request.Developer, blocks...)
 					} else if role == "user" || role == "assistant" {
 						request.Messages = append(request.Messages, bridgeMessage{Role: role, Blocks: blocks})
 					}
@@ -399,7 +404,7 @@ func decodeBridgeRequest(protocol Protocol, input map[string]any) (bridgeRequest
 	case ProtocolAnthropic:
 		request.MaxTokens = input["max_tokens"]
 		request.Stop = input["stop_sequences"]
-		request.Reasoning = firstAny(input["thinking"], input["effort"])
+		request.Reasoning = firstAny(input["thinking"], anyAt(input, "output_config", "effort"), input["effort"])
 		request.System = decodeAnthropicBlocks(input["system"])
 		for i, raw := range sliceAt(input, "messages") {
 			message, ok := raw.(map[string]any)
@@ -483,6 +488,9 @@ func encodeChatRequest(request bridgeRequest) (map[string]any, error) {
 	messages := make([]any, 0, len(request.Messages)+1)
 	if len(request.System) > 0 {
 		messages = append(messages, map[string]any{"role": "system", "content": encodeChatBlocks(request.System)})
+	}
+	if len(request.Developer) > 0 {
+		messages = append(messages, map[string]any{"role": "developer", "content": encodeChatBlocks(request.Developer)})
 	}
 	pending := make(map[string]bool)
 	pendingResults := make(map[string]bridgeBlock)
@@ -659,7 +667,13 @@ func encodeResponsesRequest(request bridgeRequest) map[string]any {
 		}
 	}
 
-	items := make([]any, 0, len(request.Messages))
+	items := make([]any, 0, len(request.Messages)+1)
+	if len(request.Developer) > 0 {
+		items = append(items, map[string]any{
+			"type": "message", "role": "developer",
+			"content": []any{map[string]any{"type": "input_text", "text": bridgeBlocksText(request.Developer)}},
+		})
+	}
 	for _, message := range request.Messages {
 		var content []any
 		flushContent := func() {
@@ -739,11 +753,16 @@ func encodeAnthropicRequest(request bridgeRequest) map[string]any {
 	} else {
 		output["max_tokens"] = request.MaxTokens
 	}
-	if effort := reasoningEffort(request.Reasoning); effort != nil {
-		output["effort"] = effort
+	if thinking, outputConfig := anthropicThinking(request.Reasoning); thinking != nil {
+		output["thinking"] = thinking
+		if outputConfig != nil {
+			output["output_config"] = outputConfig
+		}
 	}
-	if len(request.System) > 0 {
-		output["system"] = encodeAnthropicBlocks(request.System)
+	if len(request.System) > 0 || len(request.Developer) > 0 {
+		instructions := append([]bridgeBlock(nil), request.System...)
+		instructions = append(instructions, request.Developer...)
+		output["system"] = encodeAnthropicBlocks(instructions)
 	}
 
 	messages := make([]any, 0, len(request.Messages))
@@ -766,7 +785,9 @@ func encodeAnthropicRequest(request bridgeRequest) map[string]any {
 		messages = append(messages, map[string]any{"role": role, "content": content})
 	}
 	output["messages"] = messages
-	if len(request.Tools) > 0 {
+	// Anthropic has no tool_choice "none" value. Omitting the tools is the
+	// protocol-compatible representation of an explicitly disabled tool set.
+	if len(request.Tools) > 0 && request.ToolChoice.Mode != "none" {
 		tools := make([]any, 0, len(request.Tools))
 		for _, tool := range request.Tools {
 			tools = append(tools, map[string]any{
@@ -1052,6 +1073,12 @@ func decodeResponsesToolChoice(value any) bridgeToolChoice {
 }
 
 func decodeAnthropicToolChoice(value any) bridgeToolChoice {
+	if mode, ok := value.(string); ok {
+		if mode == "required" {
+			mode = "any"
+		}
+		return decodeAnthropicToolChoice(map[string]any{"type": mode})
+	}
 	choice, _ := value.(map[string]any)
 	switch stringAt(choice, "type") {
 	case "auto":
@@ -1095,7 +1122,7 @@ func encodeAnthropicToolChoice(choice bridgeToolChoice) any {
 		return map[string]any{"type": "tool", "name": choice.Name}
 	case "required":
 		return map[string]any{"type": "any"}
-	case "auto", "none":
+	case "auto":
 		return map[string]any{"type": choice.Mode}
 	default:
 		return nil
@@ -1149,7 +1176,7 @@ func decodeBridgeResponse(protocol Protocol, input map[string]any) (bridgeRespon
 				ArgumentsJSON: stringAt(function, "arguments"),
 			})
 		}
-		response.Stop = stringAt(choice, "finish_reason")
+		response.Stop = canonicalChatStop(stringAt(choice, "finish_reason"))
 		response.Usage = decodeOpenAIUsage(mapAt(input, "usage"))
 	case ProtocolResponses:
 		for _, raw := range sliceAt(input, "output") {
@@ -1173,7 +1200,9 @@ func decodeBridgeResponse(protocol Protocol, input map[string]any) (bridgeRespon
 			response.Stop = "tool_calls"
 		}
 		if stringAt(input, "status") == "incomplete" {
-			response.Stop = "length"
+			response.Stop = canonicalResponsesIncomplete(stringAt(input, "incomplete_details", "reason"))
+		} else if stringAt(input, "status") == "failed" {
+			response.Stop = "error"
 		}
 		response.Usage = decodeOpenAIUsage(mapAt(input, "usage"))
 	case ProtocolAnthropic:
@@ -1186,7 +1215,7 @@ func decodeBridgeResponse(protocol Protocol, input map[string]any) (bridgeRespon
 				response.Tools = append(response.Tools, block)
 			}
 		}
-		response.Stop = stringAt(input, "stop_reason")
+		response.Stop = canonicalAnthropicStop(stringAt(input, "stop_reason"))
 		response.Usage = decodeAnthropicUsage(mapAt(input, "usage"))
 	default:
 		return response, fmt.Errorf("unsupported response protocol %q", protocol)
@@ -1261,15 +1290,23 @@ func encodeBridgeResponse(protocol Protocol, response bridgeResponse) map[string
 				"arguments": bridgeArgumentsJSON(tool),
 			})
 		}
+		status := "completed"
+		var incomplete any
+		if response.Stop == "length" || response.Stop == "content_filter" {
+			status = "incomplete"
+			incomplete = map[string]any{"reason": responsesIncompleteReason(response.Stop)}
+		} else if response.Stop == "error" {
+			status = "failed"
+		}
 		return map[string]any{
 			"id":                 asPrefix(response.ID, "resp"),
 			"object":             "response",
 			"created_at":         response.Created,
-			"status":             "completed",
+			"status":             status,
 			"model":              response.Model,
 			"output":             output,
 			"error":              nil,
-			"incomplete_details": nil,
+			"incomplete_details": incomplete,
 			"usage": map[string]any{
 				"input_tokens":  response.Usage.Input,
 				"output_tokens": response.Usage.Output,
@@ -1373,6 +1410,8 @@ func chatStop(stop string) string {
 		return "tool_calls"
 	case "max_tokens", "length":
 		return "length"
+	case "content_filter", "error":
+		return stop
 	default:
 		return "stop"
 	}
@@ -1384,6 +1423,8 @@ func anthropicStop(stop string) string {
 		return "tool_use"
 	case "max_tokens", "length":
 		return "max_tokens"
+	case "stop_sequence", "pause_turn", "refusal":
+		return stop
 	default:
 		return "end_turn"
 	}
@@ -1398,9 +1439,99 @@ func schemaOrDefault(value any) any {
 
 func reasoningEffort(value any) any {
 	if object, ok := value.(map[string]any); ok {
-		return firstAny(object["effort"], object["type"])
+		if effort := object["effort"]; effort != nil {
+			return effort
+		}
+		switch stringAt(object, "type") {
+		case "disabled":
+			return nil
+		case "enabled", "adaptive":
+			return effortForThinkingBudget(intAt(object, "budget_tokens"))
+		default:
+			return object["type"]
+		}
 	}
 	return value
+}
+
+func anthropicThinking(value any) (any, map[string]any) {
+	if value == nil {
+		return nil, nil
+	}
+	if object, ok := value.(map[string]any); ok {
+		kind := stringAt(object, "type")
+		if kind == "enabled" || kind == "adaptive" || kind == "disabled" {
+			return value, nil
+		}
+		value = firstAny(object["effort"], object["type"])
+	}
+	effort, _ := value.(string)
+	effort = strings.ToLower(strings.TrimSpace(effort))
+	if effort == "" || effort == "none" || effort == "disabled" {
+		return nil, nil
+	}
+	budget := 4096
+	switch effort {
+	case "minimal", "low":
+		budget = 1024
+	case "medium":
+		budget = 4096
+	case "high", "xhigh", "max":
+		budget = 8192
+	}
+	return map[string]any{"type": "enabled", "budget_tokens": budget}, map[string]any{"effort": effort}
+}
+
+func effortForThinkingBudget(budget int) string {
+	if budget <= 0 || budget >= 8192 {
+		return "high"
+	}
+	if budget <= 2048 {
+		return "low"
+	}
+	return "medium"
+}
+
+func canonicalChatStop(stop string) string {
+	switch stop {
+	case "tool_calls", "function_call":
+		return "tool_calls"
+	case "length":
+		return "length"
+	case "content_filter":
+		return "content_filter"
+	default:
+		return "stop"
+	}
+}
+
+func canonicalAnthropicStop(stop string) string {
+	switch stop {
+	case "tool_use":
+		return "tool_calls"
+	case "max_tokens":
+		return "length"
+	case "stop_sequence", "pause_turn", "refusal":
+		return stop
+	default:
+		return "stop"
+	}
+}
+
+func canonicalResponsesIncomplete(reason string) string {
+	switch reason {
+	case "content_filter":
+		return "content_filter"
+	default:
+		return "length"
+	}
+}
+
+func responsesIncompleteReason(stop string) string {
+	if stop == "content_filter" {
+		return "content_filter"
+	}
+	return "max_output_tokens"
 }
 
 func bridgeBlocksText(blocks []bridgeBlock) string {

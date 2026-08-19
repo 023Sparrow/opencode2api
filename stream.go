@@ -27,6 +27,9 @@ type bridgeStreamParser struct {
 	protocol          Protocol
 	started           bool
 	tools             map[string]bool
+	toolIDs           map[string]string
+	toolNames         map[string]string
+	toolOrder         []string
 	responseArgs      map[string]bool
 	responseReasoning map[string]bool
 }
@@ -39,6 +42,8 @@ func transcodeStream(w http.ResponseWriter, reader io.Reader, from, to Protocol,
 	parser := &bridgeStreamParser{
 		protocol:          from,
 		tools:             map[string]bool{},
+		toolIDs:           map[string]string{},
+		toolNames:         map[string]string{},
 		responseArgs:      map[string]bool{},
 		responseReasoning: map[string]bool{},
 	}
@@ -146,16 +151,31 @@ func (parser *bridgeStreamParser) parseChat(value map[string]any) []bridgeStream
 			key := fmt.Sprint(firstAny(call["index"], stringAt(call, "id")))
 			function := mapAt(call, "function")
 			id := stringAt(call, "id")
-			name := stringAt(function, "name")
-			if !parser.tools[key] {
-				parser.tools[key] = true
-				events = append(events, bridgeStreamEvent{Kind: "tool_start", ToolKey: key, ToolID: id, ToolName: name})
+			if _, seen := parser.tools[key]; !seen {
+				parser.tools[key] = false
+				parser.toolOrder = append(parser.toolOrder, key)
+			}
+			if id != "" {
+				parser.toolIDs[key] = id
+			}
+			if name := stringAt(function, "name"); name != "" {
+				parser.toolNames[key] = mergeToolName(parser.toolNames[key], name)
 			}
 			if arguments := stringAt(function, "arguments"); arguments != "" {
-				events = append(events, bridgeStreamEvent{Kind: "tool_delta", ToolKey: key, ToolID: id, ToolName: name, Text: arguments})
+				if !parser.tools[key] && parser.toolNames[key] != "" {
+					parser.tools[key] = true
+					events = append(events, bridgeStreamEvent{Kind: "tool_start", ToolKey: key, ToolID: parser.toolIDs[key], ToolName: parser.toolNames[key]})
+				}
+				events = append(events, bridgeStreamEvent{Kind: "tool_delta", ToolKey: key, ToolID: parser.toolIDs[key], ToolName: parser.toolNames[key], Text: arguments})
 			}
 		}
 		if stop := stringAt(choice, "finish_reason"); stop != "" {
+			for _, key := range parser.toolOrder {
+				if !parser.tools[key] && parser.toolNames[key] != "" {
+					parser.tools[key] = true
+					events = append(events, bridgeStreamEvent{Kind: "tool_start", ToolKey: key, ToolID: parser.toolIDs[key], ToolName: parser.toolNames[key]})
+				}
+			}
 			events = append(events, bridgeStreamEvent{Kind: "finish", Stop: stop})
 		}
 	}
@@ -244,13 +264,22 @@ func (parser *bridgeStreamParser) parseResponses(eventName string, value map[str
 		item := mapAt(value, "item")
 		if stringAt(item, "type") == "function_call" {
 			key := responseToolKey(value, item)
-			parser.tools[key] = true
-			return []bridgeStreamEvent{{Kind: "tool_start", ToolKey: key, ToolID: stringAt(item, "call_id"), ToolName: stringAt(item, "name")}}
+			parser.rememberTool(key, stringAt(item, "call_id"), stringAt(item, "name"))
+			if parser.toolNames[key] != "" {
+				parser.tools[key] = true
+				return []bridgeStreamEvent{{Kind: "tool_start", ToolKey: key, ToolID: parser.toolIDs[key], ToolName: parser.toolNames[key]}}
+			}
 		}
 	case "response.function_call_arguments.delta":
 		key := responseToolKey(value, nil)
 		parser.responseArgs[key] = true
-		return []bridgeStreamEvent{{Kind: "tool_delta", ToolKey: key, Text: stringAt(value, "delta")}}
+		return []bridgeStreamEvent{{Kind: "tool_delta", ToolKey: key, ToolID: parser.toolIDs[key], ToolName: parser.toolNames[key], Text: stringAt(value, "delta")}}
+	case "response.function_call_arguments.done":
+		key := responseToolKey(value, nil)
+		if !parser.responseArgs[key] {
+			parser.responseArgs[key] = true
+			return []bridgeStreamEvent{{Kind: "tool_delta", ToolKey: key, ToolID: parser.toolIDs[key], ToolName: parser.toolNames[key], Text: stringAt(value, "arguments")}}
+		}
 	case "response.output_item.done":
 		item := mapAt(value, "item")
 		if stringAt(item, "type") == "reasoning" {
@@ -266,10 +295,11 @@ func (parser *bridgeStreamParser) parseResponses(eventName string, value map[str
 		}
 		if stringAt(item, "type") == "function_call" {
 			key := responseToolKey(value, item)
+			parser.rememberTool(key, stringAt(item, "call_id"), stringAt(item, "name"))
 			events := make([]bridgeStreamEvent, 0, 2)
 			if !parser.tools[key] {
 				parser.tools[key] = true
-				events = append(events, bridgeStreamEvent{Kind: "tool_start", ToolKey: key, ToolID: stringAt(item, "call_id"), ToolName: stringAt(item, "name")})
+				events = append(events, bridgeStreamEvent{Kind: "tool_start", ToolKey: key, ToolID: parser.toolIDs[key], ToolName: parser.toolNames[key]})
 			}
 			if !parser.responseArgs[key] {
 				if arguments := stringAt(item, "arguments"); arguments != "" {
@@ -278,18 +308,41 @@ func (parser *bridgeStreamParser) parseResponses(eventName string, value map[str
 			}
 			return events
 		}
-	case "response.completed", "response.incomplete", "response.failed":
+	case "response.completed", "response.incomplete", "response.failed", "response.done":
 		response := mapAt(value, "response")
 		usage := decodeOpenAIUsage(mapAt(response, "usage"))
 		stop := "stop"
 		if typeName == "response.incomplete" {
-			stop = "length"
+			stop = canonicalResponsesIncomplete(stringAt(response, "incomplete_details", "reason"))
 		} else if typeName == "response.failed" {
 			stop = "error"
 		}
 		return []bridgeStreamEvent{{Kind: "usage", Usage: &usage}, {Kind: "finish", Stop: stop}, {Kind: "done"}}
 	}
 	return nil
+}
+
+func (parser *bridgeStreamParser) rememberTool(key, id, name string) {
+	if _, seen := parser.tools[key]; !seen {
+		parser.tools[key] = false
+		parser.toolOrder = append(parser.toolOrder, key)
+	}
+	if id != "" {
+		parser.toolIDs[key] = id
+	}
+	if name != "" {
+		parser.toolNames[key] = name
+	}
+}
+
+func mergeToolName(current, fragment string) string {
+	if current == "" || fragment == current {
+		return fragment
+	}
+	if strings.HasPrefix(fragment, current) {
+		return fragment
+	}
+	return current + fragment
 }
 
 func responseToolKey(event map[string]any, item map[string]any) string {
@@ -305,13 +358,15 @@ func responseToolKey(event map[string]any, item map[string]any) string {
 }
 
 type bridgeStreamTool struct {
-	Key       string
-	ID        string
-	ItemID    string
-	Name      string
-	Arguments strings.Builder
-	Index     int
-	Started   bool
+	Key              string
+	ID               string
+	ItemID           string
+	Name             string
+	Arguments        strings.Builder
+	Index            int
+	AnthropicIndex   int
+	Started          bool
+	EmittedArguments int
 }
 
 type bridgeStreamEmitter struct {
@@ -397,7 +452,10 @@ func (emitter *bridgeStreamEmitter) Emit(event bridgeStreamEvent) error {
 		if event.ToolName != "" {
 			tool.Name = event.ToolName
 		}
-		return emitter.startTool(tool)
+		if err := emitter.startTool(tool); err != nil {
+			return err
+		}
+		return emitter.emitPendingToolArguments(tool)
 	case "tool_delta":
 		tool := emitter.tool(event.ToolKey)
 		if event.ToolID != "" {
@@ -406,11 +464,11 @@ func (emitter *bridgeStreamEmitter) Emit(event bridgeStreamEvent) error {
 		if event.ToolName != "" {
 			tool.Name = event.ToolName
 		}
+		tool.Arguments.WriteString(event.Text)
 		if err := emitter.startTool(tool); err != nil {
 			return err
 		}
-		tool.Arguments.WriteString(event.Text)
-		return emitter.emitToolDelta(tool, event.Text)
+		return emitter.emitPendingToolArguments(tool)
 	case "usage":
 		if event.Usage != nil {
 			mergeBridgeUsage(&emitter.usage, *event.Usage)
@@ -622,13 +680,19 @@ func (emitter *bridgeStreamEmitter) finishReasoning() error {
 }
 
 func (emitter *bridgeStreamEmitter) startTool(tool *bridgeStreamTool) error {
-	if tool.Started || emitter.target == ProtocolAnthropic {
+	if tool.Started || tool.Name == "" {
 		return nil
 	}
-	if emitter.target == ProtocolResponses {
+	if emitter.target == ProtocolResponses || emitter.target == ProtocolAnthropic {
 		if err := emitter.finishReasoning(); err != nil {
 			return err
 		}
+	}
+	if emitter.target == ProtocolAnthropic && emitter.textOpen {
+		if err := emitter.sse("content_block_stop", map[string]any{"type": "content_block_stop", "index": emitter.textIndex}); err != nil {
+			return err
+		}
+		emitter.textOpen = false
 	}
 	tool.Started = true
 	switch emitter.target {
@@ -647,12 +711,19 @@ func (emitter *bridgeStreamEmitter) startTool(tool *bridgeStreamTool) error {
 		emitter.nextOutput++
 		item := map[string]any{"id": tool.ItemID, "type": "function_call", "status": "in_progress", "arguments": "", "call_id": tool.ID, "name": tool.Name}
 		return emitter.sse("response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": tool.Index, "item": item, "sequence_number": emitter.nextSequence()})
+	case ProtocolAnthropic:
+		tool.AnthropicIndex = emitter.nextAnthropic
+		emitter.nextAnthropic++
+		return emitter.sse("content_block_start", map[string]any{
+			"type": "content_block_start", "index": tool.AnthropicIndex,
+			"content_block": map[string]any{"type": "tool_use", "id": tool.ID, "name": tool.Name, "input": map[string]any{}},
+		})
 	}
 	return nil
 }
 
 func (emitter *bridgeStreamEmitter) emitToolDelta(tool *bridgeStreamTool, delta string) error {
-	if delta == "" || emitter.target == ProtocolAnthropic {
+	if delta == "" {
 		return nil
 	}
 	switch emitter.target {
@@ -663,8 +734,23 @@ func (emitter *bridgeStreamEmitter) emitToolDelta(tool *bridgeStreamTool, delta 
 		}}}, nil)
 	case ProtocolResponses:
 		return emitter.sse("response.function_call_arguments.delta", map[string]any{"type": "response.function_call_arguments.delta", "delta": delta, "item_id": tool.ItemID, "output_index": tool.Index, "sequence_number": emitter.nextSequence()})
+	case ProtocolAnthropic:
+		return emitter.sse("content_block_delta", map[string]any{"type": "content_block_delta", "index": tool.AnthropicIndex, "delta": map[string]any{"type": "input_json_delta", "partial_json": delta}})
 	}
 	return nil
+}
+
+func (emitter *bridgeStreamEmitter) emitPendingToolArguments(tool *bridgeStreamTool) error {
+	if !tool.Started {
+		return nil
+	}
+	arguments := tool.Arguments.String()
+	if tool.EmittedArguments >= len(arguments) {
+		return nil
+	}
+	delta := arguments[tool.EmittedArguments:]
+	tool.EmittedArguments = len(arguments)
+	return emitter.emitToolDelta(tool, delta)
 }
 
 func (emitter *bridgeStreamEmitter) Finish() error {
@@ -712,22 +798,16 @@ func (emitter *bridgeStreamEmitter) Finish() error {
 		}
 		for _, key := range emitter.order {
 			tool := emitter.tools[key]
-			index := emitter.nextAnthropic
-			emitter.nextAnthropic++
-			if err := emitter.sse("content_block_start", map[string]any{
-				"type":          "content_block_start",
-				"index":         index,
-				"content_block": map[string]any{"type": "tool_use", "id": tool.ID, "name": tool.Name, "input": map[string]any{}},
-			}); err != nil {
+			if err := emitter.startTool(tool); err != nil {
 				return err
 			}
-			if arguments := tool.Arguments.String(); arguments != "" {
-				if err := emitter.sse("content_block_delta", map[string]any{"type": "content_block_delta", "index": index, "delta": map[string]any{"type": "input_json_delta", "partial_json": arguments}}); err != nil {
+			if err := emitter.emitPendingToolArguments(tool); err != nil {
+				return err
+			}
+			if tool.Started {
+				if err := emitter.sse("content_block_stop", map[string]any{"type": "content_block_stop", "index": tool.AnthropicIndex}); err != nil {
 					return err
 				}
-			}
-			if err := emitter.sse("content_block_stop", map[string]any{"type": "content_block_stop", "index": index}); err != nil {
-				return err
 			}
 		}
 		if err := emitter.sse("message_delta", map[string]any{
@@ -783,6 +863,15 @@ func (emitter *bridgeStreamEmitter) finishResponsesItems() error {
 	for _, key := range emitter.order {
 		tool := emitter.tools[key]
 		arguments := tool.Arguments.String()
+		if arguments == "" {
+			arguments = "{}"
+		}
+		if err := emitter.startTool(tool); err != nil {
+			return err
+		}
+		if err := emitter.emitPendingToolArguments(tool); err != nil {
+			return err
+		}
 		if err := emitter.sse("response.function_call_arguments.done", map[string]any{"type": "response.function_call_arguments.done", "arguments": arguments, "item_id": tool.ItemID, "output_index": tool.Index, "sequence_number": emitter.nextSequence()}); err != nil {
 			return err
 		}

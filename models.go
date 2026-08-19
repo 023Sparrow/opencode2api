@@ -191,6 +191,12 @@ func toSet(items []string) map[string]bool {
 
 func inferProtocol(model string) Protocol {
 	m := strings.ToLower(model)
+	// This compatibility model speaks Chat Completions despite being exposed
+	// beside models whose names can imply newer OpenAI-style protocols. An
+	// explicit models.protocols entry is resolved before this default.
+	if m == "deepseek-v4-flash-free" {
+		return ProtocolChat
+	}
 	for _, prefix := range []string{"claude-", "qwen"} {
 		if strings.HasPrefix(m, prefix) {
 			return ProtocolAnthropic
