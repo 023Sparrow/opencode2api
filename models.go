@@ -39,6 +39,19 @@ type modelRoute struct {
 	Anonymous bool
 }
 
+type ModelRouteDiagnostic struct {
+	Model                string            `json:"model"`
+	RequestedProtocol    Protocol          `json:"requested_protocol,omitempty"`
+	NativeProtocol       Protocol          `json:"native_protocol"`
+	ProtocolSource       string            `json:"protocol_source"`
+	AvailableZen         bool              `json:"available_zen"`
+	AvailableGo          bool              `json:"available_go"`
+	Tier                 Tier              `json:"tier,omitempty"`
+	Anonymous            bool              `json:"anonymous"`
+	AnonymousEligibility AnonymousDecision `json:"anonymous_eligibility"`
+	RouteError           string            `json:"route_error,omitempty"`
+}
+
 type modelCatalog struct {
 	mu        sync.RWMutex
 	zen       map[string]bool
@@ -141,6 +154,29 @@ func (c *modelCatalog) anonymousDecision(model string) AnonymousDecision {
 		return c.metadata.Decide(model)
 	}
 	return AnonymousDecision{Allowed: isFreeModel(model), Source: "name_fallback_metadata_pending"}
+}
+
+func (c *modelCatalog) Diagnostic(model string, requested Protocol, hasZenKeys, hasGoKeys, hasAnonymous bool) ModelRouteDiagnostic {
+	c.mu.RLock()
+	protocol, explicit := c.protocols[model]
+	zen, goModel := c.zen[model], c.goModels[model]
+	c.mu.RUnlock()
+	source := "configured"
+	if !explicit {
+		protocol = inferProtocol(model)
+		source = "inferred"
+	}
+	diagnostic := ModelRouteDiagnostic{
+		Model: model, RequestedProtocol: requested, NativeProtocol: protocol, ProtocolSource: source,
+		AvailableZen: zen, AvailableGo: goModel, AnonymousEligibility: c.anonymousDecision(model),
+	}
+	route, err := c.Route(model, hasZenKeys, hasGoKeys, hasAnonymous)
+	if err != nil {
+		diagnostic.RouteError = err.Error()
+		return diagnostic
+	}
+	diagnostic.Tier, diagnostic.Anonymous = route.Tier, route.Anonymous
+	return diagnostic
 }
 
 func isFreeModel(model string) bool {

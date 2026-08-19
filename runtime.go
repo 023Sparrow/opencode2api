@@ -281,6 +281,36 @@ func (m *RuntimeManager) Resources() ResourceSnapshot {
 	return result
 }
 
+func (m *RuntimeManager) DebugModels() ([]ModelRouteDiagnostic, MetadataSnapshot) {
+	runtime := m.current.Load()
+	if runtime == nil {
+		return nil, MetadataSnapshot{}
+	}
+	gateway := runtime.gateway
+	models := gateway.catalog.List()
+	result := make([]ModelRouteDiagnostic, 0, len(models))
+	for _, model := range models {
+		if !supportedModel(model) {
+			continue
+		}
+		result = append(result, gateway.catalog.Diagnostic(model, "", len(gateway.cfg.ZenKeys) > 0, len(gateway.cfg.GoKeys) > 0, gateway.cfg.Anonymous))
+	}
+	metadata := MetadataSnapshot{}
+	if gateway.catalog.metadata != nil {
+		metadata = gateway.catalog.metadata.Snapshot()
+	}
+	return result, metadata
+}
+
+func (m *RuntimeManager) DebugRoute(model string, requested Protocol) ModelRouteDiagnostic {
+	runtime := m.current.Load()
+	if runtime == nil {
+		return ModelRouteDiagnostic{Model: model, RequestedProtocol: requested, RouteError: "gateway runtime is unavailable"}
+	}
+	gateway := runtime.gateway
+	return gateway.catalog.Diagnostic(model, requested, len(gateway.cfg.ZenKeys) > 0, len(gateway.cfg.GoKeys) > 0, gateway.cfg.Anonymous)
+}
+
 func keyStatuses(tier string, pool *nodePool) []KeyStatus {
 	result := make([]KeyStatus, 0, len(pool.nodes))
 	for _, node := range pool.nodes {
