@@ -535,6 +535,9 @@ func (emitter *bridgeStreamEmitter) Emit(event bridgeStreamEvent) error {
 			if emitter.target != ProtocolResponses && event.Text == "" {
 				event.Text = anthropicRedactedThinkingPlaceholder
 			}
+			if emitter.target == ProtocolResponses && event.Text == "" {
+				return emitter.startReasoning()
+			}
 		}
 		if event.Text == "" {
 			return nil
