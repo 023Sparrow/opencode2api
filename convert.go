@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -84,6 +85,7 @@ type bridgeResponse struct {
 	Reasoning []bridgeBlock
 	Tools     []bridgeBlock
 	Stop      string
+	Error     string
 	Usage     bridgeUsage
 	Created   int64
 }
@@ -295,7 +297,10 @@ func decodeBridgeRequest(protocol Protocol, input map[string]any) (bridgeRequest
 				return request, fmt.Errorf("messages[%d] must be an object", i)
 			}
 			role := stringAt(message, "role")
-			blocks := decodeOpenAIBlocks(message["content"])
+			blocks, err := decodeOpenAIBlocksChecked(message["content"])
+			if err != nil {
+				return request, fmt.Errorf("messages[%d]: %w", i, err)
+			}
 			if role == "assistant" {
 				blocks = append(decodeChatReasoning(message), blocks...)
 			}
@@ -348,7 +353,11 @@ func decodeBridgeRequest(protocol Protocol, input map[string]any) (bridgeRequest
 		request.MaxTokens = input["max_output_tokens"]
 		request.Stop = input["stop"]
 		request.Reasoning = firstAny(input["reasoning"], input["reasoning_effort"])
-		request.System = append(request.System, decodeOpenAIBlocks(input["instructions"])...)
+		instructions, err := decodeOpenAIBlocksChecked(input["instructions"])
+		if err != nil {
+			return request, fmt.Errorf("instructions: %w", err)
+		}
+		request.System = append(request.System, instructions...)
 		switch value := input["input"].(type) {
 		case string:
 			request.Messages = append(request.Messages, bridgeMessage{Role: "user", Blocks: []bridgeBlock{{Kind: "text", Text: value}}})
@@ -378,7 +387,10 @@ func decodeBridgeRequest(protocol Protocol, input map[string]any) (bridgeRequest
 					})
 				case "message", "":
 					role := stringAt(item, "role")
-					blocks := decodeOpenAIBlocks(item["content"])
+					blocks, err := decodeOpenAIBlocksChecked(item["content"])
+					if err != nil {
+						return request, fmt.Errorf("input[%d]: %w", i, err)
+					}
 					if role == "system" {
 						request.System = append(request.System, blocks...)
 					} else if role == "developer" {
@@ -409,7 +421,11 @@ func decodeBridgeRequest(protocol Protocol, input map[string]any) (bridgeRequest
 		request.MaxTokens = input["max_tokens"]
 		request.Stop = input["stop_sequences"]
 		request.Reasoning = firstAny(input["thinking"], anyAt(input, "output_config", "effort"), input["effort"])
-		request.System = decodeAnthropicBlocks(input["system"])
+		blocks, err := decodeAnthropicBlocksChecked(input["system"])
+		if err != nil {
+			return request, fmt.Errorf("system: %w", err)
+		}
+		request.System = blocks
 		for i, raw := range sliceAt(input, "messages") {
 			message, ok := raw.(map[string]any)
 			if !ok {
@@ -420,17 +436,29 @@ func decodeBridgeRequest(protocol Protocol, input map[string]any) (bridgeRequest
 			// into the messages array instead of using the top-level system
 			// field. Fold them into the system prompt rather than rejecting.
 			if role == "system" {
-				request.System = append(request.System, decodeAnthropicBlocks(message["content"])...)
+				blocks, err := decodeAnthropicBlocksChecked(message["content"])
+				if err != nil {
+					return request, fmt.Errorf("messages[%d]: %w", i, err)
+				}
+				request.System = append(request.System, blocks...)
 				continue
 			}
 			if role == "developer" {
-				request.Developer = append(request.Developer, decodeAnthropicBlocks(message["content"])...)
+				blocks, err := decodeAnthropicBlocksChecked(message["content"])
+				if err != nil {
+					return request, fmt.Errorf("messages[%d]: %w", i, err)
+				}
+				request.Developer = append(request.Developer, blocks...)
 				continue
 			}
 			if role != "user" && role != "assistant" {
 				return request, fmt.Errorf("messages[%d] has unsupported role %q", i, role)
 			}
-			request.Messages = append(request.Messages, bridgeMessage{Role: role, Blocks: decodeAnthropicBlocks(message["content"])})
+			blocks, err := decodeAnthropicBlocksChecked(message["content"])
+			if err != nil {
+				return request, fmt.Errorf("messages[%d]: %w", i, err)
+			}
+			request.Messages = append(request.Messages, bridgeMessage{Role: role, Blocks: blocks})
 		}
 		for i, raw := range sliceAt(input, "tools") {
 			tool, ok := raw.(map[string]any)
@@ -820,18 +848,26 @@ func encodeAnthropicRequest(request bridgeRequest) map[string]any {
 }
 
 func decodeOpenAIBlocks(value any) []bridgeBlock {
+	blocks, _ := decodeOpenAIBlocksChecked(value)
+	return blocks
+}
+
+func decodeOpenAIBlocksChecked(value any) ([]bridgeBlock, error) {
 	switch value := value.(type) {
 	case string:
 		if value == "" {
-			return nil
+			return nil, nil
 		}
-		return []bridgeBlock{{Kind: "text", Text: value}}
+		return []bridgeBlock{{Kind: "text", Text: value}}, nil
 	case map[string]any:
-		return decodeOpenAIBlocks([]any{value})
+		return decodeOpenAIBlocksChecked([]any{value})
 	case []any:
 		blocks := make([]bridgeBlock, 0, len(value))
 		for _, raw := range value {
-			part, _ := raw.(map[string]any)
+			part, ok := raw.(map[string]any)
+			if !ok {
+				return nil, errors.New("OpenAI content block must be an object")
+			}
 			switch stringAt(part, "type") {
 			case "text", "input_text", "output_text":
 				blocks = append(blocks, bridgeBlock{Kind: "text", Text: stringAt(part, "text")})
@@ -839,24 +875,37 @@ func decodeOpenAIBlocks(value any) []bridgeBlock {
 				blocks = append(blocks, bridgeBlock{Kind: "image", URL: firstString(stringAt(part, "image_url", "url"), stringAt(part, "image_url"))})
 			case "input_image":
 				blocks = append(blocks, bridgeBlock{Kind: "image", URL: stringAt(part, "image_url")})
+			default:
+				return nil, fmt.Errorf("unsupported OpenAI content block type %q", stringAt(part, "type"))
 			}
 		}
-		return blocks
+		return blocks, nil
 	default:
-		return nil
+		if value == nil {
+			return nil, nil
+		}
+		return nil, errors.New("unsupported OpenAI content value")
 	}
 }
 
 func decodeAnthropicBlocks(value any) []bridgeBlock {
+	blocks, _ := decodeAnthropicBlocksChecked(value)
+	return blocks
+}
+
+func decodeAnthropicBlocksChecked(value any) ([]bridgeBlock, error) {
 	if text, ok := value.(string); ok {
 		if text == "" {
-			return nil
+			return nil, nil
 		}
-		return []bridgeBlock{{Kind: "text", Text: text}}
+		return []bridgeBlock{{Kind: "text", Text: text}}, nil
 	}
 	var blocks []bridgeBlock
 	for _, raw := range asSlice(value) {
-		part, _ := raw.(map[string]any)
+		part, ok := raw.(map[string]any)
+		if !ok {
+			return nil, errors.New("Anthropic content block must be an object")
+		}
 		switch stringAt(part, "type") {
 		case "thinking":
 			blocks = append(blocks, bridgeBlock{
@@ -889,9 +938,11 @@ func decodeAnthropicBlocks(value any) []bridgeBlock {
 				Result:  part["content"],
 				IsError: boolAt(part, "is_error"),
 			})
+		default:
+			return nil, fmt.Errorf("unsupported Anthropic content block type %q", stringAt(part, "type"))
 		}
 	}
-	return blocks
+	return blocks, nil
 }
 
 func decodeChatReasoning(message map[string]any) []bridgeBlock {
@@ -959,7 +1010,11 @@ func bridgeReasoningText(blocks []bridgeBlock) (string, bool) {
 	}
 	var text strings.Builder
 	for _, block := range blocks {
-		text.WriteString(block.Text)
+		if block.Text != "" {
+			text.WriteString(block.Text)
+		} else if block.Encrypted != "" {
+			text.WriteString(anthropicRedactedThinkingPlaceholder)
+		}
 	}
 	return text.String(), true
 }
@@ -1156,6 +1211,9 @@ func convertResponse(from, to Protocol, body []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	if response.Error != "" || response.Stop == "error" {
+		return nil, fmt.Errorf("upstream response failed: %s", firstString(response.Error, "upstream response failed"))
+	}
 	return json.Marshal(encodeBridgeResponse(to, response))
 }
 
@@ -1173,6 +1231,12 @@ func decodeBridgeResponse(protocol Protocol, input map[string]any) (bridgeRespon
 	}
 	switch protocol {
 	case ProtocolChat:
+		if message := stringAt(input, "error", "message"); message != "" {
+			response.Error = message
+		}
+		if response.Error != "" {
+			return response, nil
+		}
 		choices := sliceAt(input, "choices")
 		if len(choices) == 0 {
 			return response, fmt.Errorf("chat response contains no choices")
@@ -1180,7 +1244,11 @@ func decodeBridgeResponse(protocol Protocol, input map[string]any) (bridgeRespon
 		choice, _ := choices[0].(map[string]any)
 		message := mapAt(choice, "message")
 		response.Reasoning = decodeChatReasoning(message)
-		response.Text = bridgeBlocksText(decodeOpenAIBlocks(message["content"]))
+		blocks, err := decodeOpenAIBlocksChecked(message["content"])
+		if err != nil {
+			return response, fmt.Errorf("chat response content: %w", err)
+		}
+		response.Text = bridgeBlocksText(blocks)
 		for _, raw := range sliceAt(message, "tool_calls") {
 			call, _ := raw.(map[string]any)
 			function := mapAt(call, "function")
@@ -1200,7 +1268,11 @@ func decodeBridgeResponse(protocol Protocol, input map[string]any) (bridgeRespon
 			case "reasoning":
 				response.Reasoning = append(response.Reasoning, decodeResponsesReasoning(item)...)
 			case "message":
-				response.Text += bridgeBlocksText(decodeOpenAIBlocks(item["content"]))
+				blocks, err := decodeOpenAIBlocksChecked(item["content"])
+				if err != nil {
+					return response, fmt.Errorf("Responses response content: %w", err)
+				}
+				response.Text += bridgeBlocksText(blocks)
 			case "function_call":
 				response.Tools = append(response.Tools, bridgeBlock{
 					Kind:          "tool_call",
@@ -1218,10 +1290,18 @@ func decodeBridgeResponse(protocol Protocol, input map[string]any) (bridgeRespon
 			response.Stop = canonicalResponsesIncomplete(stringAt(input, "incomplete_details", "reason"))
 		} else if stringAt(input, "status") == "failed" {
 			response.Stop = "error"
+			response.Error = firstString(stringAt(input, "error", "message"), "upstream Responses request failed")
 		}
 		response.Usage = decodeOpenAIUsage(mapAt(input, "usage"))
 	case ProtocolAnthropic:
-		for _, block := range decodeAnthropicBlocks(input["content"]) {
+		if stringAt(input, "type") == "error" {
+			response.Error = firstString(stringAt(input, "error", "message"), "upstream Anthropic request failed")
+		}
+		blocks, err := decodeAnthropicBlocksChecked(input["content"])
+		if err != nil {
+			return response, fmt.Errorf("Anthropic response content: %w", err)
+		}
+		for _, block := range blocks {
 			if block.Kind == "reasoning" {
 				response.Reasoning = append(response.Reasoning, block)
 			} else if block.Kind == "text" {
@@ -1530,6 +1610,8 @@ func canonicalChatStop(stop string) string {
 		return "length"
 	case "content_filter":
 		return "content_filter"
+	case "error", "network_error", "server_error":
+		return "error"
 	default:
 		return "stop"
 	}
@@ -1543,6 +1625,8 @@ func canonicalAnthropicStop(stop string) string {
 		return "length"
 	case "stop_sequence", "pause_turn", "refusal":
 		return stop
+	case "error", "network_error", "server_error":
+		return "error"
 	default:
 		return "stop"
 	}

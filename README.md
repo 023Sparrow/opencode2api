@@ -328,6 +328,10 @@ socks5://127.0.0.1:1080  # 备用代理
 
 跨协议桥接会区分 Chat/Responses 的 system 与 developer 指令，在 Anthropic 目标中按顺序合并为 system 内容；reasoning effort 会转换为兼容 thinking 预算。工具选择、空参数 `{}`、停止原因，以及 SSE 中延迟到达的工具名称、参数分片和完成事件也会转换到目标协议的对应形态。
 
+流式响应会兼容 Chat 上游的 `delta.reasoning_content` 与 `delta.reasoning`。Anthropic 上游的 `event: error`、Responses 上游的 `response.failed` 以及 Chat 的错误类 `finish_reason` 会转换为目标协议的结构化错误事件，不会伪装成正常结束或静默断流。`redacted_thinking` 在支持加密 reasoning 的 Responses 目标中保留 `encrypted_content`，在无法表达加密块的 Chat/Anthropic 目标中使用 `[redacted thinking]` 明确占位。
+
+协议文档未定义或当前 bridge 无法无损表达的输入 content block（例如未实现的音频/文件类型）会返回明确的转换错误，不再静默丢弃内容。
+
 ### `performance`
 
 | 字段 | 含义 |
