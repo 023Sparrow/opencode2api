@@ -608,7 +608,7 @@ func (emitter *bridgeStreamEmitter) start() error {
 				"content":       []any{},
 				"stop_reason":   nil,
 				"stop_sequence": nil,
-				"usage":         map[string]any{"input_tokens": 0, "output_tokens": 0},
+				"usage":         anthropicUsage(bridgeUsage{}),
 			},
 		})
 	case ProtocolResponses:
@@ -890,7 +890,7 @@ func (emitter *bridgeStreamEmitter) Finish() error {
 		if err := emitter.sse("message_delta", map[string]any{
 			"type":  "message_delta",
 			"delta": map[string]any{"stop_reason": anthropicStop(emitter.stop), "stop_sequence": nil},
-			"usage": map[string]any{"input_tokens": emitter.usage.Input, "output_tokens": emitter.usage.Output},
+			"usage": anthropicUsage(emitter.usage),
 		}); err != nil {
 			return err
 		}
@@ -1025,6 +1025,9 @@ func mergeBridgeUsage(destination *bridgeUsage, source bridgeUsage) {
 	}
 	if source.Cached != 0 {
 		destination.Cached = source.Cached
+	}
+	if source.CacheCreation != 0 {
+		destination.CacheCreation = source.CacheCreation
 	}
 	if source.Reasoning != 0 {
 		destination.Reasoning = source.Reasoning

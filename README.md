@@ -70,7 +70,7 @@ Token 页面展示用量覆盖率、每分钟趋势、模型排行与 Zen/Go Tie
 | `upstream` | 上游尝试的 `lifetime`、`last_hour` 与 `recent`。按 Tier、匿名/Key 通道、Key 指纹聚合。 |
 | `resources` | 模型目录、Key 冷却、脱敏代理节点、匿名开关和 models.dev metadata 状态。 |
 
-`usage.*.tokens` 与模型/Tier 项均包含 `input_tokens`、`output_tokens`、`cached_tokens`、`reasoning_tokens`、`total_tokens`。`metrics.series` 的每分钟点也包含这些 Token 字段和 `usage_reported`。普通 JSON、同协议 SSE 与跨协议 SSE 响应都会解析上游 usage；`coverage` 是收到 usage 的推理请求数除以已建立上游路由的推理请求数。上游未提供 usage 时不会估算 Token。
+`usage.*.tokens` 与模型/Tier 项均包含 `input_tokens`、`output_tokens`、`cached_tokens`、`reasoning_tokens`、`total_tokens`。其中 `input_tokens` 统一表示包含缓存读写的总输入，`cached_tokens` 单独表示缓存读取量。`metrics.series` 的每分钟点也包含这些 Token 字段和 `usage_reported`。普通 JSON、同协议 SSE 与跨协议 SSE 响应都会解析上游 usage；`coverage` 是收到 usage 的推理请求数除以已建立上游路由的推理请求数。上游未提供 usage 时不会估算 Token。
 
 每个 `upstream.recent` 项包含时间、Request ID、模型、Tier、尝试序号、匿名标记、通道、Key 指纹、`proxy_node`、HTTP 状态、耗时、成功标记和结果分类。匿名请求的 Key ID 固定显示为 `anonymous`；真实 Key 只显示 SHA-256 稳定短指纹。代理 URL 的认证信息会被移除，字段名称明确为代理节点而非出口 IP。
 

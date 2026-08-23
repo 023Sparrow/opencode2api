@@ -66,11 +66,15 @@ type bridgeRequest struct {
 }
 
 type bridgeUsage struct {
-	Input     int
-	Output    int
-	Total     int
-	Cached    int
-	Reasoning int
+	// Input is the total prompt input, including cache reads and writes. This
+	// matches OpenAI's prompt_tokens semantics and lets each output encoder
+	// split the provider-specific cache fields exactly once.
+	Input         int
+	Output        int
+	Total         int
+	Cached        int
+	CacheCreation int
+	Reasoning     int
 }
 
 type bridgeResponse struct {
@@ -1351,11 +1355,7 @@ func encodeBridgeResponse(protocol Protocol, response bridgeResponse) map[string
 			"content":       content,
 			"stop_reason":   anthropicStop(response.Stop),
 			"stop_sequence": nil,
-			"usage": map[string]any{
-				"input_tokens":            response.Usage.Input,
-				"output_tokens":           response.Usage.Output,
-				"cache_read_input_tokens": response.Usage.Cached,
-			},
+			"usage":         anthropicUsage(response.Usage),
 		}
 	default:
 		return map[string]any{}
@@ -1370,18 +1370,28 @@ func decodeOpenAIUsage(usage map[string]any) bridgeUsage {
 		total = input + output
 	}
 	cached := firstNonZero(intAt(usage, "prompt_tokens_details", "cached_tokens"), intAt(usage, "input_tokens_details", "cached_tokens"))
+	cacheCreation := firstNonZero(
+		intAt(usage, "cache_creation_input_tokens"),
+		intAt(usage, "prompt_tokens_details", "cache_creation_input_tokens"),
+		intAt(usage, "prompt_tokens_details", "cache_write_tokens"),
+		intAt(usage, "input_tokens_details", "cache_creation_input_tokens"),
+	)
 	reasoning := firstNonZero(intAt(usage, "completion_tokens_details", "reasoning_tokens"), intAt(usage, "output_tokens_details", "reasoning_tokens"))
-	return bridgeUsage{Input: input, Output: output, Total: total, Cached: cached, Reasoning: reasoning}
+	return bridgeUsage{Input: input, Output: output, Total: total, Cached: cached, CacheCreation: cacheCreation, Reasoning: reasoning}
 }
 
 func decodeAnthropicUsage(usage map[string]any) bridgeUsage {
 	input := intAt(usage, "input_tokens")
+	cached := intAt(usage, "cache_read_input_tokens")
+	cacheCreation := intAt(usage, "cache_creation_input_tokens")
 	output := intAt(usage, "output_tokens")
+	input += cached + cacheCreation
 	return bridgeUsage{
-		Input:  input,
-		Output: output,
-		Total:  input + output,
-		Cached: intAt(usage, "cache_read_input_tokens"),
+		Input:         input,
+		Output:        output,
+		Total:         input + output,
+		Cached:        cached,
+		CacheCreation: cacheCreation,
 	}
 }
 
@@ -1396,6 +1406,15 @@ func openAIUsage(usage bridgeUsage) map[string]any {
 		"completion_tokens_details": map[string]any{
 			"reasoning_tokens": usage.Reasoning,
 		},
+	}
+}
+
+func anthropicUsage(usage bridgeUsage) map[string]any {
+	return map[string]any{
+		"input_tokens":                max(usage.Input-usage.Cached-usage.CacheCreation, 0),
+		"output_tokens":               usage.Output,
+		"cache_creation_input_tokens": usage.CacheCreation,
+		"cache_read_input_tokens":     usage.Cached,
 	}
 }
 
