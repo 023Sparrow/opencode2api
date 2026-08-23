@@ -412,6 +412,17 @@ func decodeBridgeRequest(protocol Protocol, input map[string]any) (bridgeRequest
 				return request, fmt.Errorf("messages[%d] must be an object", i)
 			}
 			role := stringAt(message, "role")
+			// Some clients (e.g. Claude Code) inline system/developer messages
+			// into the messages array instead of using the top-level system
+			// field. Fold them into the system prompt rather than rejecting.
+			if role == "system" {
+				request.System = append(request.System, decodeAnthropicBlocks(message["content"])...)
+				continue
+			}
+			if role == "developer" {
+				request.Developer = append(request.Developer, decodeAnthropicBlocks(message["content"])...)
+				continue
+			}
 			if role != "user" && role != "assistant" {
 				return request, fmt.Errorf("messages[%d] has unsupported role %q", i, role)
 			}
